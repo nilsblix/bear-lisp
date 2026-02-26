@@ -409,17 +409,14 @@ impl Expr {
             },
             Apply(b) => {
                 let f = (*b).0.eval_expr(env)?;
-                let arg = (*b).1.eval_expr(env)?;
-                let mut primed = vec![arg];
+                let arg = &(*b).1.eval_expr(env)?;
+                let primed = vec![arg];
                 match f {
-                    LO::Primitive(_, f) => {
-                        let primed_ref: Vec<&LO> = primed.iter().collect();
-                        f(primed_ref.as_slice())
-                    },
+                    LO::Primitive(_, f) => f(primed.as_slice()),
                     _ => {
-                        let mut v = vec![f];
-                        v.append(&mut primed);
-                        Ok(LO::list_to_pair(v))
+                        let s = "cannot apply to a non-primitive: '".to_string()
+                            + &f.to_string() + "'";
+                        Err(LispError::Type(s))
                     },
                 }
             },
@@ -437,16 +434,14 @@ impl Expr {
                 for arg in args.iter() {
                     primed.push(arg.eval_expr(env)?);
                 }
+                let primed: Vec<&LO> = primed.iter().collect();
 
                 match f {
-                    LO::Primitive(_, f) => {
-                        let primed_ref: Vec<&LO> = primed.iter().collect();
-                        f(primed_ref.as_slice())
-                    },
+                    LO::Primitive(_, f) => f(primed.as_slice()),
                     _ => {
-                        let mut v = vec![f];
-                        v.append(&mut primed);
-                        Ok(LO::list_to_pair(v))
+                        let s = "cannot call a non-primitive: '".to_string()
+                            + &f.to_string() + "'";
+                        Err(LispError::Type(s))
                     },
                 }
             },
@@ -492,7 +487,7 @@ fn basis() -> LO {
     use LO::Primitive;
     fn num_args(name: &str, n: usize, args: &[&LO]) -> Result<(), LispError> {
         if args.len() != n {
-            let s = name.to_string() + " takes " + &n.to_string()
+            let s = "'".to_string() + name + "' primitive takes " + &n.to_string()
                 + " arguments, found: " + &args.len().to_string();
             return Err(LispError::Type(s));
         }
@@ -500,14 +495,14 @@ fn basis() -> LO {
         Ok(())
     }
 
-    let plus = Primitive("+".to_string(), |args| {
+    let add = Primitive("+".to_string(), |args| {
         num_args("+", 2, args)?;
 
         if let (LO::Fixnum(a), LO::Fixnum(b)) = (args[0], args[1]) {
             Ok(LO::Fixnum(a + b))
         } else {
-            let s = "'+' takes integer arguments, found: '".to_string()
-                + &args[0].to_string() + "' and '" + &args[1].to_string();
+            let s = "'+' primitive takes integer arguments, found: '".to_string()
+                + &args[0].to_string() + "' and '" + &args[1].to_string() + "'";
             Err(LispError::Type(s))
         }
     });
@@ -517,9 +512,21 @@ fn basis() -> LO {
         Ok(LO::Pair(Box::new((args[0].clone(), args[1].clone()))))
     });
 
+
+    let list = Primitive("list".to_string(), |args| {
+        fn prim_list(args: &[&LO]) -> LO {
+            match args {
+                [] => LO::Nil,
+                [car, cdr @ ..] => LO::Pair(Box::new(((*car).clone(), prim_list(cdr)))),
+            }
+        }
+        Ok(prim_list(args))
+    });
+
     let env = LO::Nil;
-    let env = bind("+".to_string(), plus, env);
+    let env = bind("+".to_string(), add, env);
     let env = bind("pair".to_string(), pair, env);
+    let env = bind("list".to_string(), list, env);
     env
 }
 
@@ -689,11 +696,11 @@ mod tests {
         let ast = e.build_ast().unwrap();
         assert_eq!(ast.eval(LO::Nil).unwrap().0.to_string(), "1");
 
-        let input = Cursor::new("(if #f (if #t 1 2) (if #t (34 35) 12))");
+        let input = Cursor::new("(if #f (if #t 1 2) (if #t (list 34 35) 12))");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
         let ast = e.build_ast().unwrap();
-        assert_eq!(ast.eval(LO::Nil).unwrap().0.to_string(), "(34 35)");
+        assert_eq!(ast.eval(basis()).unwrap().0.to_string(), "(34 35)");
 
         let env = LO::Nil;
 
