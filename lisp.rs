@@ -409,23 +409,28 @@ impl Expr {
             },
             Apply(b) => {
                 let f = (*b).0.eval_expr(env)?;
-                let arg = &(*b).1.eval_expr(env)?;
-                if let LO::Pair(cell) = arg {
-                    let (v1, v2) = cell.as_ref();
-                    let primed = vec![v1, v2];
-                    return match f {
-                        LO::Primitive(_, f) => f(primed.as_slice()),
-                        _ => {
-                            let s = "cannot apply to a non-primitive: '".to_string()
-                                + &f.to_string() + "'";
-                            Err(LispError::Type(s))
-                        },
-                    }
+                let arg_list = (*b).1.eval_expr(env)?;
+                if !is_list(&arg_list) {
+                    let s = "cannot apply a non-list '".to_string()
+                        + &arg_list.to_string() + "' to a primitive";
+                    return Err(LispError::Type(s));
                 }
 
-                let s = "cannot apply a non-pair '".to_string()
-                    + &arg.to_string() + "' to a primitive";
-                Err(LispError::Type(s))
+                let mut primed = Vec::new();
+                for arg in arg_list.pair_to_list() {
+                    let ast = arg.build_ast()?;
+                    primed.push(ast.eval_expr(env)?);
+                }
+                let primed_ref: Vec<&LO> = primed.iter().collect();
+
+                match f {
+                    LO::Primitive(_, f) => f(primed_ref.as_slice()),
+                    _ => {
+                        let s = "cannot apply to a non-primitive: '".to_string()
+                            + &f.to_string() + "'";
+                        Err(LispError::Type(s))
+                    },
+                }
             },
             Call(b) => {
                 if let (Expr::Var(name), true) = (&(*b).0, (*b).1.is_empty()) {
