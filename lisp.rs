@@ -246,24 +246,18 @@ fn is_list(xs: &LO) -> bool {
 }
 
 fn pair_to_list(xs: &LO) -> Vec<&LO> {
-    use LO::*;
     let mut out = Vec::new();
-
     let mut p = xs;
     loop {
-        if is_list(p) {
-            match p {
-                Pair(cell) => {
-                    let (fst, snd) = cell.as_ref();
-                    out.push(fst);
-                    p = snd;
-                    continue;
-                },
-                Nil => break,
-                _ => panic!("malformed list"),
-            }
+        match p {
+            LO::Pair(cell) => {
+                let (fst, snd) = cell.as_ref();
+                out.push(fst);
+                p = snd;
+            },
+            LO::Nil => break,
+            _ => panic!("malformed list"),
         }
-        break;
     }
     out
 }
@@ -309,11 +303,21 @@ fn lookup<'a>(name: &str, env: &'a LO) -> Option<&'a LO> {
 impl LO {
     fn cons_from_vec(v: Vec<LO>) -> LO {
         let mut acc = LO::Nil;
-        for lo in v.iter() {
-            acc = LO::Pair(Box::new((lo.clone(), acc)));
+        for lo in v.into_iter().rev() {
+            acc = LO::Pair(Box::new((lo, acc)));
         }
-        // we built this, therefore we know that it is valid.
-        reverse_list(acc).unwrap()
+        acc
+    }
+
+    fn eval_args(args: &[&LO], env: LO) -> Result<(Vec<LO>, LO), LispError> {
+        let mut values = Vec::with_capacity(args.len());
+        let mut env_cur = env;
+        for arg in args {
+            let (val, env_next) = arg.eval(env_cur)?;
+            values.push(val);
+            env_cur = env_next;
+        }
+        Ok((values, env_cur))
     }
 
     /// Returns the result and a modified env, in case the evaluation has side-effects.
@@ -337,7 +341,7 @@ impl LO {
             Pair(_) if is_list(self) => {
                 match pair_to_list(self).as_slice() {
                     [] => Ok((Nil, env)),
-                    [sym, cond, if_true, if_false] if **sym == Symbol("if".to_string()) => {
+                    [sym, cond, if_true, if_false] if matches!(sym, Symbol(s) if s == "if") => {
                         let (cond_val, _) = cond.eval(env.clone())?;
                         match cond_val {
                             Bool(true) => if_true.eval(env),
@@ -349,25 +353,21 @@ impl LO {
                             },
                         }
                     },
-                    [sym, name, val] if **sym == Symbol("val".to_string()) => {
+                    [sym, name, val] if matches!(sym, Symbol(s) if s == "val") => {
                         let (val_prime, env) = val.eval(env)?;
                         let env_prime = bind(name.to_string(), val_prime.clone(), env);
                         Ok((val_prime, env_prime))
                     },
 
-                    [sym] if **sym == Symbol("env".to_string()) => Ok((env.clone(), env)),
+                    [sym] if matches!(sym, Symbol(s) if s == "env") => Ok((env.clone(), env)),
                     [lhs, args @ ..] => {
-                        let func = lhs.eval(env.clone())?.0;
-                        // FIXME: Evaluate the arguments via primed.
-                        // Could not implement it right now due to primitive's function having a
-                        // weird signature, and not being able to create &[&LO] in a smart way.
-                        //
-                        // let primed: Vec<LO> = Vec::new();
-                        // for (i, elem) in primed.iter().enumerate() {
-                        //     primed.push(elem.eval(env.clone())?.0);
-                        // }
+                        let (func, env) = lhs.eval(env)?;
                         match func {
-                            Primitive(_, f) => Ok((f(args)?, env)),
+                            Primitive(_, f) => {
+                                let (evaluated, env) = LO::eval_args(args, env)?;
+                                let arg_refs: Vec<&LO> = evaluated.iter().collect();
+                                Ok((f(&arg_refs)?, env))
+                            },
                             _ => Ok((self.clone(), env)),
                         }
                     },
@@ -640,7 +640,7 @@ mod tests {
         let e = s.read_lo().unwrap();
         assert_eq!(e.eval(basis()).unwrap().0.to_string(), "((12 . 13) . 14)");
 
-        let input = Cursor::new("(pair 12 (pair 12 14))");
+        let input = Cursor::new("(pair 12 (pair 13 14))");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
         assert_eq!(e.eval(basis()).unwrap().0.to_string(), "(12 . (13 . 14))");
