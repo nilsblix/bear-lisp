@@ -276,14 +276,6 @@ fn lookup<'a>(name: &str, env: &'a LO) -> Result<&'a LO, LispError> {
         }
     }
 
-    if let Primitive(n, _) = binding {
-        if n == name {
-            return Ok(binding);
-        } else {
-            return lookup(name, rest);
-        }
-    }
-
     let s = "could not find '".to_string() + name + "'";
     return Err(LispError::Env(s));
 }
@@ -521,7 +513,10 @@ fn basis() -> LO {
         Ok(LO::Pair(Box::new((args[0].clone(), args[1].clone()))))
     });
 
-    LO::list_to_pair(vec![pair, plus])
+    let env = LO::Nil;
+    let env = bind("+".to_string(), plus, env);
+    let env = bind("pair".to_string(), pair, env);
+    env
 }
 
 fn repl<R: BufRead>(stream: &mut Stream<R>, env: LO) -> io::Result<()> {
