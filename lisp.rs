@@ -12,8 +12,37 @@ struct Stream<R: BufRead> {
 #[derive(Debug)]
 pub enum End {
     Eof,
-    ParseError(String),
     Io(std::io::Error),
+    Lisp(LispError),
+}
+
+impl fmt::Display for End {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use End::*;
+        match self {
+            Eof => write!(f, "eof"),
+            Io(e) => write!(f, "{e}"),
+            Lisp(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum LispError {
+    Parse(String),
+    Type(String),
+    Env(String),
+}
+
+impl fmt::Display for LispError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use LispError::*;
+        match self {
+            Parse(e) => write!(f, "{e}"),
+            Type(e) => write!(f, "{e}"),
+            Env(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 fn symbol_start(c: char) -> bool {
@@ -161,13 +190,13 @@ impl<R: BufRead> Stream<R> {
                 self.eat_whitespace().map_err(|e| End::Io(e))?;
                 let nc = self.read_char().map_err(|e| End::Io(e))?;
                 if nc.is_none() {
-                    return Err(End::ParseError("unexpected eof in list".to_string()));
+                    return Err(End::Lisp(LispError::Parse("unexpected eof in list".to_string())));
                 }
 
                 let nc = nc.unwrap();
 
                 if nc == ')' {
-                    return reverse_list(acc);
+                    return reverse_list(acc).map_err(|e| End::Lisp(LispError::Parse(e)));
                 }
 
                 self.unread_char(nc);
@@ -178,7 +207,7 @@ impl<R: BufRead> Stream<R> {
 
         let mut s = "unexpected char: ".to_string();
         s.push(c);
-        Err(End::ParseError(s))
+        Err(End::Lisp(LispError::Parse(s)))
     }
 }
 
@@ -190,9 +219,10 @@ enum LO {
     Symbol(String),
     Nil,
     Pair(Box<(LO, LO)>),
+    Primitive(String, fn(&[&LO]) -> Result<LO, LispError>),
 }
 
-fn reverse_list(mut xs: LO) -> Result<LO, End> {
+fn reverse_list(mut xs: LO) -> Result<LO, String> {
     let mut out = LO::Nil;
     loop {
         match xs {
@@ -202,7 +232,7 @@ fn reverse_list(mut xs: LO) -> Result<LO, End> {
                 out = LO::Pair(Box::new((car, out)));
                 xs = cdr;
             },
-            _ => return Err(End::ParseError("malformed list".to_string())),
+            _ => return Err("malformed list".to_string()),
         }
     }
 }
@@ -238,6 +268,116 @@ fn pair_to_list(xs: &LO) -> Vec<&LO> {
     out
 }
 
+/// env is a list (i.e a pair of pair of etc... with nil at the end), therefore bind creates a new
+/// end with puts the (name, value) pair at the front of the env.
+///
+/// Ex:
+/// ```
+/// bind("hello", 12, (("world" . 13) ("var" 90))) -> (("hello" . 12) ("world" . 13) ("var" 90))
+/// ```
+fn bind(name: String, value: LO, env: LO) -> LO {
+    use LO::*;
+    let binding = Pair(Box::new((Symbol(name), value)));
+    Pair(Box::new((binding, env)))
+}
+
+fn lookup<'a>(name: &str, env: &'a LO) -> Option<&'a LO> {
+    use LO::*;
+
+    let Pair(env_cell) = env else { return None; };
+    let (binding, rest) = env_cell.as_ref();
+
+    if let Pair(binding_cell) = binding {
+        let (key, value) = binding_cell.as_ref();
+        return match key {
+            Symbol(k) if k == name => Some(value),
+            _ => lookup(name, rest),
+        }
+    }
+
+    if let Primitive(n, _) = binding {
+        if n == name {
+            return Some(binding);
+        } else {
+            return lookup(name, rest);
+        }
+    }
+
+    None
+}
+
+impl LO {
+    fn cons_from_vec(v: Vec<LO>) -> LO {
+        let mut acc = LO::Nil;
+        for lo in v.iter() {
+            acc = LO::Pair(Box::new((lo.clone(), acc)));
+        }
+        // we built this, therefore we know that it is valid.
+        reverse_list(acc).unwrap()
+    }
+
+    /// Returns the result and a modified env, in case the evaluation has side-effects.
+    fn eval(&self, env: LO) -> Result<(LO, LO), LispError> {
+        use LO::*;
+
+        match self {
+            Symbol(name) => {
+                let value = match lookup(name, &env) {
+                    Some(x) => x,
+                    None => {
+                        let mut s = "did not find '".to_string();
+                        s += &name.to_string();
+                        s += "' in env";
+                        return Err(LispError::Env(s));
+                    },
+                };
+
+                Ok((value.clone(), env))
+            }
+            Pair(_) if is_list(self) => {
+                match pair_to_list(self).as_slice() {
+                    [] => Ok((Nil, env)),
+                    [sym, cond, if_true, if_false] if **sym == Symbol("if".to_string()) => {
+                        let (cond_val, _) = cond.eval(env.clone())?;
+                        match cond_val {
+                            Bool(true) => if_true.eval(env),
+                            Bool(false) => if_false.eval(env),
+                            _ => {
+                                let mut s = "expected bool in if condition, found: ".to_string();
+                                s += &cond_val.to_string();
+                                Err(LispError::Type(s))
+                            },
+                        }
+                    },
+                    [sym, name, val] if **sym == Symbol("val".to_string()) => {
+                        let (val_prime, env) = val.eval(env)?;
+                        let env_prime = bind(name.to_string(), val_prime.clone(), env);
+                        Ok((val_prime, env_prime))
+                    },
+
+                    [sym] if **sym == Symbol("env".to_string()) => Ok((env.clone(), env)),
+                    [lhs, args @ ..] => {
+                        let func = lhs.eval(env.clone())?.0;
+                        // FIXME: Evaluate the arguments via primed.
+                        // Could not implement it right now due to primitive's function having a
+                        // weird signature, and not being able to create &[&LO] in a smart way.
+                        //
+                        // let primed: Vec<LO> = Vec::new();
+                        // for (i, elem) in primed.iter().enumerate() {
+                        //     primed.push(elem.eval(env.clone())?.0);
+                        // }
+                        match func {
+                            Primitive(_, f) => Ok((f(args)?, env)),
+                            _ => Ok((self.clone(), env)),
+                        }
+                    },
+                }
+            },
+            Fixnum(_) | Bool(_) | Nil | Primitive(_, _) | Pair(_) => Ok((self.clone(), env)),
+        }
+    }
+}
+
 impl fmt::Display for LO {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use LO::*;
@@ -267,91 +407,41 @@ impl fmt::Display for LO {
                 }
                 write!(f, ")")
             },
+            Primitive(name, _) => write!(f, "#<primitive:{name}>"),
         }
     }
 }
 
-/// env is a list (i.e a pair of pair of etc... with nil at the end), therefore bind creates a new
-/// end with puts the (name, value) pair at the front of the env.
-///
-/// Ex:
-/// ```
-/// bind("hello", 12, (("world" . 13) ("var" 90))) -> (("hello" . 12) ("world" . 13) ("var" 90))
-/// ```
-fn bind(name: String, value: LO, env: LO) -> LO {
-    use LO::*;
-    let binding = Pair(Box::new((Symbol(name), value)));
-    Pair(Box::new((binding, env)))
-}
-
-fn lookup<'a>(name: &str, env: &'a LO) -> Option<&'a LO> {
-    use LO::*;
-
-    let Pair(env_cell) = env else { return None; };
-    let (binding, rest) = env_cell.as_ref();
-
-    let Pair(binding_cell) = binding else { return None; };
-    let (key, value) = binding_cell.as_ref();
-
-    match key {
-        Symbol(k) if k == name => Some(value),
-        _ => lookup(name, rest),
-    }
-}
-
-impl LO {
-    /// Returns the result and a modified env, in case the evaluation has side-effects.
-    fn eval(&self, env: LO) -> Result<(LO, LO), String> {
-        use LO::*;
-
-        match self {
-            Fixnum(_) => Ok((self.clone(), env)),
-            Bool(_) => Ok((self.clone(), env)),
-            Symbol(name) => {
-                let value = match lookup(name, &env) {
-                    Some(x) => x,
-                    None => {
-                        let mut s = "did not find ".to_string();
-                        s += &name.to_string();
-                        s += " in env";
-                        return Err(s);
-                    },
-                };
-
-                Ok((value.clone(), env))
-            }
-            Nil => Ok((self.clone(), env)),
-            Pair(_) if is_list(self) => {
-                match pair_to_list(self).as_slice() {
-                    [sym, cond, if_true, if_false] if **sym == Symbol("if".to_string()) => {
-                        let (cond_val, env) = cond.eval(env)?;
-                        match cond_val {
-                            Bool(true) => if_true.eval(env),
-                            Bool(false) => if_false.eval(env),
-                            _ => {
-                                let mut s = "expected bool in if condition, found: ".to_string();
-                                s += &cond_val.to_string();
-                                Err(s)
-                            },
-                        }
-                    },
-                    [sym, name, val] if **sym == Symbol("val".to_string()) => {
-                        let (val_prime, env) = val.eval(env)?;
-                        let env_prime = bind(name.to_string(), val_prime.clone(), env);
-                        Ok((val_prime, env_prime))
-                    },
-                    [sym] if **sym == Symbol("env".to_string()) => Ok((env.clone(), env)),
-                    [sym, car, cdr] if **sym == Symbol("pair".to_string()) => {
-                        let (car_prime, env) = car.eval(env)?;
-                        let (cdr_prime, env) = cdr.eval(env)?;
-                        Ok((Pair(Box::new((car_prime, cdr_prime))), env))
-                    },
-                    _ => Ok((self.clone(), env)),
-                }
-            },
-            _ => Ok((self.clone(), env)),
+fn basis() -> LO {
+    use LO::Primitive;
+    fn num_args(name: &str, n: usize, args: &[&LO]) -> Result<(), LispError> {
+        if args.len() != n {
+            let s = name.to_string() + " takes " + &n.to_string()
+                + " arguments, found: " + &args.len().to_string();
+            return Err(LispError::Type(s));
         }
+
+        Ok(())
     }
+
+    let plus = Primitive("+".to_string(), |args| {
+        num_args("+", 2, args)?;
+
+        if let (LO::Fixnum(a), LO::Fixnum(b)) = (args[0], args[1]) {
+            Ok(LO::Fixnum(a + b))
+        } else {
+            let s = "'+' takes integer arguments, found: '".to_string()
+                + &args[0].to_string() + "' and '" + &args[1].to_string();
+            Err(LispError::Type(s))
+        }
+    });
+
+    let pair = Primitive("pair".to_string(), |args| {
+        num_args("pair", 2, args)?;
+        Ok(LO::Pair(Box::new((args[0].clone(), args[1].clone()))))
+    });
+
+    LO::cons_from_vec(vec![pair, plus])
 }
 
 fn repl<R: BufRead>(stream: &mut Stream<R>, env: LO) -> io::Result<()> {
@@ -363,8 +453,8 @@ fn repl<R: BufRead>(stream: &mut Stream<R>, env: LO) -> io::Result<()> {
         let expr = match stream.read_lo() {
             Ok(lo) => lo,
             Err(End::Eof) => break,
-            Err(End::ParseError(e)) => {
-                println!("error: parse: {e}");
+            Err(End::Lisp(e)) => {
+                println!("error: lisp: {e}");
                 continue;
             }
             Err(End::Io(e)) => {
@@ -389,7 +479,7 @@ fn repl<R: BufRead>(stream: &mut Stream<R>, env: LO) -> io::Result<()> {
 
 fn main() -> io::Result<()> {
     let mut stream = Stream::new(io::stdin().lock());
-    repl(&mut stream, LO::Nil)?;
+    repl(&mut stream, basis())?;
     Ok(())
 }
 
@@ -492,6 +582,14 @@ mod tests {
     }
 
     #[test]
+    fn test_cons_from_vec() {
+        let a = LO::Fixnum(45);
+        let b = LO::Bool(false);
+        let c = LO::Symbol("hello-world".to_string());
+        assert_eq!(LO::cons_from_vec(vec![a, b, c]).to_string(), "(45 #f hello-world)")
+    }
+
+    #[test]
     fn eval() {
         use io::Cursor;
 
@@ -521,5 +619,30 @@ mod tests {
 
         assert_eq!(lookup("x", &env), Some(&LO::Bool(true)));
         assert_eq!(lookup("y", &env), Some(&LO::Fixnum(-12)));
+    }
+
+    #[test]
+    fn eval_basis() {
+        use io::Cursor;
+
+        let input = Cursor::new("(+ 12 13)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        assert_eq!(e.eval(basis()).unwrap().0.to_string(), "25");
+
+        let input = Cursor::new("(pair 12 13)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        assert_eq!(e.eval(basis()).unwrap().0.to_string(), "(12 . 13)");
+
+        let input = Cursor::new("(pair (pair 12 13) 14)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        assert_eq!(e.eval(basis()).unwrap().0.to_string(), "((12 . 13) . 14)");
+
+        let input = Cursor::new("(pair 12 (pair 12 14))");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        assert_eq!(e.eval(basis()).unwrap().0.to_string(), "(12 . (13 . 14))");
     }
 }
