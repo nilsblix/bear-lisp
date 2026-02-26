@@ -18,7 +18,7 @@ pub enum End {
 
 fn symbol_start(c: char) -> bool {
     match c {
-        '*'|'/'|'>'|'<'|'='|'?'|'!'|'-'|'+'|'A'..'Z'|'a'..'z' => true,
+        '*'|'/'|'>'|'<'|'='|'?'|'!'|'-'|'+'|'A'..='Z'|'a'..='z' => true,
         _ => false,
     }
 }
@@ -215,6 +215,29 @@ fn is_list(xs: &LO) -> bool {
     }
 }
 
+fn pair_to_list(xs: &LO) -> Vec<&LO> {
+    use LO::*;
+    let mut out = Vec::new();
+
+    let mut p = xs;
+    loop {
+        if is_list(p) {
+            match p {
+                Pair(cell) => {
+                    let (fst, snd) = cell.as_ref();
+                    out.push(fst);
+                    p = snd;
+                    continue;
+                },
+                Nil => break,
+                _ => panic!("malformed list"),
+            }
+        }
+        break;
+    }
+    out
+}
+
 impl fmt::Display for LO {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use LO::*;
@@ -277,67 +300,6 @@ fn lookup<'a>(name: &str, env: &'a LO) -> Option<&'a LO> {
 }
 
 impl LO {
-    fn eval_if_form(&self, tail: &LO, env: LO) -> Result<(LO, LO), String> {
-        use LO::*;
-
-        let (cond, if_true, if_false, rest) = match tail {
-            Pair(t1) => match t1.as_ref() {
-                (cond, Pair(t2)) => match t2.as_ref() {
-                    (if_true, Pair(t3)) => {
-                        let (if_false, rest) = t3.as_ref();
-                        (cond, if_true, if_false, rest)
-                    },
-                    _ => return Ok((self.clone(), env)),
-                },
-                _ => return Ok((self.clone(), env)),
-            },
-            _ => return Ok((self.clone(), env)),
-        };
-
-        if *rest != Nil {
-            let mut s = "unexpected tokens after else-branch, found: ".to_string();
-            s += &rest.to_string();
-            return Err(s);
-        }
-
-        let (cond_val, env) = cond.eval(env)?;
-
-        match cond_val {
-            Bool(true) => if_true.eval(env),
-            Bool(false) => if_false.eval(env),
-            _ => {
-                let mut s = "expected bool in if condition, found: ".to_string();
-                s += &cond_val.to_string();
-                Err(s)
-            },
-        }
-    }
-
-    fn eval_val_form(&self, tail: &LO, env: LO) -> Result<(LO, LO), String> {
-        use LO::*;
-
-        let (name, val, rest) = match tail {
-            Pair(t1) => match t1.as_ref() {
-                (Symbol(name), Pair(t2)) => {
-                    let (value, rest) = t2.as_ref();
-                    (name, value, rest)
-                },
-                _ => return Ok((self.clone(), env)),
-            },
-            _ => return Ok((self.clone(), env)),
-        };
-
-        if *rest != Nil {
-            let mut s = "unexpected tokens after val bind, found: ".to_string();
-            s += &rest.to_string();
-            return Err(s);
-        }
-
-        let (val_prime, env) = val.eval(env)?;
-        let env_prime = bind(name.to_string(), val_prime.clone(), env);
-        Ok((val_prime, env_prime))
-    }
-
     /// Returns the result and a modified env, in case the evaluation has side-effects.
     fn eval(&self, env: LO) -> Result<(LO, LO), String> {
         use LO::*;
@@ -359,14 +321,35 @@ impl LO {
                 Ok((value.clone(), env))
             }
             Nil => Ok((self.clone(), env)),
-            Pair(cell) => {
-                let (head, tail) = cell.as_ref();
-                match head {
-                    Symbol(sym) if sym == "if" =>  self.eval_if_form(tail, env),
-                    Symbol(sym) if sym == "val" => self.eval_val_form(tail, env),
+            Pair(_) if is_list(self) => {
+                match pair_to_list(self).as_slice() {
+                    [sym, cond, if_true, if_false] if **sym == Symbol("if".to_string()) => {
+                        let (cond_val, env) = cond.eval(env)?;
+                        match cond_val {
+                            Bool(true) => if_true.eval(env),
+                            Bool(false) => if_false.eval(env),
+                            _ => {
+                                let mut s = "expected bool in if condition, found: ".to_string();
+                                s += &cond_val.to_string();
+                                Err(s)
+                            },
+                        }
+                    },
+                    [sym, name, val] if **sym == Symbol("val".to_string()) => {
+                        let (val_prime, env) = val.eval(env)?;
+                        let env_prime = bind(name.to_string(), val_prime.clone(), env);
+                        Ok((val_prime, env_prime))
+                    },
+                    [sym] if **sym == Symbol("env".to_string()) => Ok((env.clone(), env)),
+                    [sym, car, cdr] if **sym == Symbol("pair".to_string()) => {
+                        let (car_prime, env) = car.eval(env)?;
+                        let (cdr_prime, env) = cdr.eval(env)?;
+                        Ok((Pair(Box::new((car_prime, cdr_prime))), env))
+                    },
                     _ => Ok((self.clone(), env)),
                 }
             },
+            _ => Ok((self.clone(), env)),
         }
     }
 }
@@ -442,6 +425,22 @@ mod tests {
         assert_eq!(s.read_char().unwrap().unwrap(), 'l');
         assert_eq!(s.read_char().unwrap().unwrap(), 'd');
         assert_eq!(s.read_char().unwrap(), None); // eof
+    }
+
+    #[test]
+    fn test_pair_to_list() {
+        use io::Cursor;
+        let input = Cursor::new("(1 2 3 4 5 350)");
+        let mut s = Stream::new(input);
+
+        let lo = s.read_lo().unwrap();
+        let v = pair_to_list(&lo);
+        let exp: Vec<LO> = vec![1 as i64, 2, 3, 4, 5, 350].iter().map(|x| LO::Fixnum(*x)).collect();
+        assert_eq!(v.len(), exp.len());
+
+        for (i, val) in v.iter().enumerate() {
+            assert_eq!(**val, exp[i]);
+        }
     }
 
     #[test]
