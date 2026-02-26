@@ -245,23 +245,6 @@ fn is_list(xs: &LO) -> bool {
     }
 }
 
-fn pair_to_list(xs: &LO) -> Vec<&LO> {
-    let mut out = Vec::new();
-    let mut p = xs;
-    loop {
-        match p {
-            LO::Pair(cell) => {
-                let (fst, snd) = cell.as_ref();
-                out.push(fst);
-                p = snd;
-            },
-            LO::Nil => break,
-            _ => panic!("malformed list"),
-        }
-    }
-    out
-}
-
 /// env is a list (i.e a pair of pair of etc... with nil at the end), therefore bind creates a new
 /// end with puts the (name, value) pair at the front of the env.
 ///
@@ -275,33 +258,69 @@ fn bind(name: String, value: LO, env: LO) -> LO {
     Pair(Box::new((binding, env)))
 }
 
-fn lookup<'a>(name: &str, env: &'a LO) -> Option<&'a LO> {
+fn lookup<'a>(name: &str, env: &'a LO) -> Result<&'a LO, LispError> {
     use LO::*;
 
-    let Pair(env_cell) = env else { return None; };
+    let Pair(env_cell) = env else {
+        let s = "empty env, could not find '".to_string() + name + "'";
+        return Err(LispError::Env(s));
+    };
+
     let (binding, rest) = env_cell.as_ref();
 
     if let Pair(binding_cell) = binding {
         let (key, value) = binding_cell.as_ref();
         return match key {
-            Symbol(k) if k == name => Some(value),
+            Symbol(k) if k == name => Ok(value),
             _ => lookup(name, rest),
         }
     }
 
     if let Primitive(n, _) = binding {
         if n == name {
-            return Some(binding);
+            return Ok(binding);
         } else {
             return lookup(name, rest);
         }
     }
 
-    None
+    let s = "could not find '".to_string() + name + "'";
+    return Err(LispError::Env(s));
 }
 
 impl LO {
-    fn cons_from_vec(v: Vec<LO>) -> LO {
+    fn build_ast(&self) -> Result<Expr, LispError> {
+        use LO::*;
+        match self {
+            Primitive(_, _) => unreachable!(), // shouldn't happen at this stage.
+            Symbol(s) => Ok(Expr::Var(s.clone())),
+            Pair(_) if is_list(self) => {
+                match self.pair_to_list().as_slice() {
+                    [] => Err(LispError::Parse("poorly formed expression".to_string())),
+                    [sym, cond, if_true, if_false] if matches!(sym, Symbol(s) if s == "if") =>
+                        Ok(Expr::If(Box::new((cond.build_ast()?, if_true.build_ast()?, if_false.build_ast()?)))),
+                    [sym, c1, c2] if matches!(sym, Symbol(s) if s == "and") =>
+                        Ok(Expr::And(Box::new((c1.build_ast()?, c2.build_ast()?)))),
+                    [sym, c1, c2] if matches!(sym, Symbol(s) if s == "or") =>
+                        Ok(Expr::Or(Box::new((c1.build_ast()?, c2.build_ast()?)))),
+                    [sym, func, args] if matches!(sym, Symbol(s) if s == "apply") =>
+                        Ok(Expr::Apply(Box::new((func.build_ast()?, args.build_ast()?)))),
+                    [sym, Symbol(n), e] if matches!(sym, Symbol(s) if s == "val") =>
+                        Ok(Expr::Def(Box::new(Definition::Val(n.clone(), e.build_ast()?)))),
+                    [func, args @ ..] => {
+                        let mut values = Vec::with_capacity(args.len());
+                        for arg in args {
+                            values.push(arg.build_ast()?);
+                        }
+                        Ok(Expr::Call(Box::new((func.build_ast()?, values))))
+                    },
+                }
+            },
+            Fixnum(_) | Bool(_) | Nil | Pair(_) => Ok(Expr::Literal(self.clone())),
+        }
+    }
+
+    fn list_to_pair(v: Vec<LO>) -> LO {
         let mut acc = LO::Nil;
         for lo in v.into_iter().rev() {
             acc = LO::Pair(Box::new((lo, acc)));
@@ -309,71 +328,132 @@ impl LO {
         acc
     }
 
-    fn eval_args(args: &[&LO], env: LO) -> Result<(Vec<LO>, LO), LispError> {
-        let mut values = Vec::with_capacity(args.len());
-        let mut env_cur = env;
-        for arg in args {
-            let (val, env_next) = arg.eval(env_cur)?;
-            values.push(val);
-            env_cur = env_next;
+    fn pair_to_list(&self) -> Vec<&LO> {
+        let mut out = Vec::new();
+        let mut p = self;
+        loop {
+            match p {
+                LO::Pair(cell) => {
+                    let (fst, snd) = cell.as_ref();
+                    out.push(fst);
+                    p = snd;
+                },
+                LO::Nil => break,
+                _ => panic!("malformed list"),
+            }
         }
-        Ok((values, env_cur))
+        out
+    }
+}
+
+enum Expr {
+    Literal(LO),
+    Var(String),
+    If(Box<(Expr, Expr, Expr)>),
+    And(Box<(Expr, Expr)>),
+    Or(Box<(Expr, Expr)>),
+    Apply(Box<(Expr, Expr)>),
+    Call(Box<(Expr, Vec<Expr>)>),
+    Def(Box<Definition>),
+}
+
+enum Definition {
+    Val(String, Expr),
+    Expr(Expr),
+}
+
+impl Expr {
+    fn eval(&self, env: LO) -> Result<(LO, LO), LispError> {
+        match self {
+            Expr::Def(d) => Expr::eval_def(d, env),
+            e => Ok((e.eval_expr(&env)?, env)),
+        }
     }
 
-    /// Returns the result and a modified env, in case the evaluation has side-effects.
-    fn eval(&self, env: LO) -> Result<(LO, LO), LispError> {
-        use LO::*;
+    /// Returns the modified env.
+    fn eval_def(def: &Definition, env: LO) -> Result<(LO, LO), LispError> {
+        match def {
+            Definition::Val(n, e) => {
+                let v = e.eval_expr(&env)?;
+                let env_prime = bind(n.clone(), v.clone(), env);
+                Ok((v, env_prime))
+            },
+            Definition::Expr(e) => Ok((e.eval_expr(&env)?, env)),
+        }
+    }
+
+    /// Does not modify env, and returns the evaluated expression.
+    fn eval_expr(&self, env: &LO) -> Result<LO, LispError> {
+        use Expr::*;
 
         match self {
-            Symbol(name) => {
-                let value = match lookup(name, &env) {
-                    Some(x) => x,
-                    None => {
-                        let mut s = "did not find '".to_string();
-                        s += &name.to_string();
-                        s += "' in env";
-                        return Err(LispError::Env(s));
+            Def(_) => unreachable!(),
+            Literal(l) => Ok(l.clone()),
+            Var(n) => lookup(&n, env).map(|x| x.clone()),
+            If(b) => match (*b).0.eval_expr(env)? {
+                LO::Bool(true) => Ok((*b).1.eval_expr(env)?),
+                LO::Bool(false) => Ok((*b).2.eval_expr(env)?),
+                other => {
+                    let s = "if statement condition did not resolve to a bool, found: '".to_string()
+                        + &other.to_string() + "'";
+                    Err(LispError::Type(s))
+                },
+            },
+            And(b) => match ((*b).0.eval_expr(env)?, (*b).1.eval_expr(env)?) {
+                | (LO::Bool(v1), LO::Bool(v2)) => Ok(LO::Bool(v1 && v2)),
+                | (v1, v2) => {
+                    let s = "and statement conditions did not resolve to bools, found: '".to_string()
+                        + &v1.to_string() + "' and '" + &v2.to_string() + "'";
+                    Err(LispError::Type(s))
+                },
+            },
+            Or(b) => match ((*b).0.eval_expr(env)?, (*b).1.eval_expr(env)?) {
+                | (LO::Bool(v1), LO::Bool(v2)) => Ok(LO::Bool(v1 || v2)),
+                | (v1, v2) => {
+                    let s = "or statement conditions did not resolve to bools, found: '".to_string()
+                        + &v1.to_string() + "' and '" + &v2.to_string() + "'";
+                    Err(LispError::Type(s))
+                },
+            },
+            Apply(b) => {
+                let f = (*b).0.eval_expr(env)?;
+                let arg = (*b).1.eval_expr(env)?;
+                let mut primed = vec![arg];
+                match f {
+                    LO::Primitive(_, f) => {
+                        let primed_ref: Vec<&LO> = primed.iter().collect();
+                        f(primed_ref.as_slice())
                     },
-                };
-
-                Ok((value.clone(), env))
-            }
-            Pair(_) if is_list(self) => {
-                match pair_to_list(self).as_slice() {
-                    [] => Ok((Nil, env)),
-                    [sym, cond, if_true, if_false] if matches!(sym, Symbol(s) if s == "if") => {
-                        let (cond_val, _) = cond.eval(env.clone())?;
-                        match cond_val {
-                            Bool(true) => if_true.eval(env),
-                            Bool(false) => if_false.eval(env),
-                            _ => {
-                                let mut s = "expected bool in if condition, found: ".to_string();
-                                s += &cond_val.to_string();
-                                Err(LispError::Type(s))
-                            },
-                        }
-                    },
-                    [sym, name, val] if matches!(sym, Symbol(s) if s == "val") => {
-                        let (val_prime, env) = val.eval(env)?;
-                        let env_prime = bind(name.to_string(), val_prime.clone(), env);
-                        Ok((val_prime, env_prime))
-                    },
-
-                    [sym] if matches!(sym, Symbol(s) if s == "env") => Ok((env.clone(), env)),
-                    [lhs, args @ ..] => {
-                        let (func, env) = lhs.eval(env)?;
-                        match func {
-                            Primitive(_, f) => {
-                                let (evaluated, env) = LO::eval_args(args, env)?;
-                                let arg_refs: Vec<&LO> = evaluated.iter().collect();
-                                Ok((f(&arg_refs)?, env))
-                            },
-                            _ => Ok((self.clone(), env)),
-                        }
+                    _ => {
+                        let mut v = vec![f];
+                        v.append(&mut primed);
+                        Ok(LO::list_to_pair(v))
                     },
                 }
             },
-            Fixnum(_) | Bool(_) | Nil | Primitive(_, _) | Pair(_) => Ok((self.clone(), env)),
+            Call(b) if matches!((*b).0.eval_expr(env)?, LO::Symbol(s) if s == "env") =>
+                Ok(env.clone()),
+            Call(b) => {
+                let f = (*b).0.eval_expr(env)?;
+
+                let args = &(*b).1;
+                let mut primed = Vec::with_capacity(args.len());
+                for arg in args.iter() {
+                    primed.push(arg.eval_expr(env)?);
+                }
+
+                match f {
+                    LO::Primitive(_, f) => {
+                        let primed_ref: Vec<&LO> = primed.iter().collect();
+                        f(primed_ref.as_slice())
+                    },
+                    _ => {
+                        let mut v = vec![f];
+                        v.append(&mut primed);
+                        Ok(LO::list_to_pair(v))
+                    },
+                }
+            },
         }
     }
 }
@@ -441,10 +521,13 @@ fn basis() -> LO {
         Ok(LO::Pair(Box::new((args[0].clone(), args[1].clone()))))
     });
 
-    LO::cons_from_vec(vec![pair, plus])
+    LO::list_to_pair(vec![pair, plus])
 }
 
 fn repl<R: BufRead>(stream: &mut Stream<R>, env: LO) -> io::Result<()> {
+    use End::*;
+    use LispError::*;
+
     let mut e = env;
     loop {
         print!("> ");
@@ -452,21 +535,29 @@ fn repl<R: BufRead>(stream: &mut Stream<R>, env: LO) -> io::Result<()> {
 
         let expr = match stream.read_lo() {
             Ok(lo) => lo,
-            Err(End::Eof) => break,
-            Err(End::Lisp(e)) => {
+            Err(Eof) => break,
+            Err(Lisp(e)) => {
                 println!("error: lisp: {e}");
                 continue;
             }
-            Err(End::Io(e)) => {
+            Err(Io(e)) => {
                 println!("error: io: {e}");
                 continue;
             },
         };
 
-        let (result, env_prime) = match expr.eval(e.clone()) {
+        let ast = match expr.build_ast() {
+            Ok(a) => a,
+            Err(Parse(e)) | Err(Type(e)) | Err(Env(e)) => {
+                println!("error: lisp: {e}");
+                continue;
+            },
+        };
+
+        let (result, env_prime) = match ast.eval(e.clone()) {
             Ok(x) => x,
-            Err(e) => {
-                println!("error: eval: {e}");
+            Err(Parse(e)) | Err(Type(e)) | Err(Env(e)) => {
+                println!("error: lisp: {e}");
                 continue;
             },
         };
@@ -524,7 +615,7 @@ mod tests {
         let mut s = Stream::new(input);
 
         let lo = s.read_lo().unwrap();
-        let v = pair_to_list(&lo);
+        let v = lo.pair_to_list();
         let exp: Vec<LO> = vec![1 as i64, 2, 3, 4, 5, 350].iter().map(|x| LO::Fixnum(*x)).collect();
         assert_eq!(v.len(), exp.len());
 
@@ -586,7 +677,7 @@ mod tests {
         let a = LO::Fixnum(45);
         let b = LO::Bool(false);
         let c = LO::Symbol("hello-world".to_string());
-        assert_eq!(LO::cons_from_vec(vec![a, b, c]).to_string(), "(45 #f hello-world)")
+        assert_eq!(LO::list_to_pair(vec![a, b, c]).to_string(), "(45 #f hello-world)")
     }
 
     #[test]
@@ -596,29 +687,33 @@ mod tests {
         let input = Cursor::new("(if #t (if #t 1 2) 3)");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
-        assert_eq!(e.eval(LO::Nil).unwrap().0.to_string(), "1");
+        let ast = e.build_ast().unwrap();
+        assert_eq!(ast.eval(LO::Nil).unwrap().0.to_string(), "1");
 
         let input = Cursor::new("(if #f (if #t 1 2) (if #t (34 35) 12))");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
-        assert_eq!(e.eval(LO::Nil).unwrap().0.to_string(), "(34 35)");
+        let ast = e.build_ast().unwrap();
+        assert_eq!(ast.eval(LO::Nil).unwrap().0.to_string(), "(34 35)");
 
         let env = LO::Nil;
 
         let input = Cursor::new("(val x #t)");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
-        let (res, env) = e.eval(env).unwrap();
+        let ast = e.build_ast().unwrap();
+        let (res, env) = ast.eval(env).unwrap();
         assert_eq!(res.to_string(), "#t");
 
         let input = Cursor::new("(val y (if x ~12 13))");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
-        let (res, env) = e.eval(env).unwrap();
+        let ast = e.build_ast().unwrap();
+        let (res, env) = ast.eval(env).unwrap();
         assert_eq!(res.to_string(), "-12");
 
-        assert_eq!(lookup("x", &env), Some(&LO::Bool(true)));
-        assert_eq!(lookup("y", &env), Some(&LO::Fixnum(-12)));
+        assert_eq!(lookup("x", &env).unwrap(), &LO::Bool(true));
+        assert_eq!(lookup("y", &env).unwrap(), &LO::Fixnum(-12));
     }
 
     #[test]
@@ -628,21 +723,25 @@ mod tests {
         let input = Cursor::new("(+ 12 13)");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
-        assert_eq!(e.eval(basis()).unwrap().0.to_string(), "25");
+        let ast = e.build_ast().unwrap();
+        assert_eq!(ast.eval(basis()).unwrap().0.to_string(), "25");
 
         let input = Cursor::new("(pair 12 13)");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
-        assert_eq!(e.eval(basis()).unwrap().0.to_string(), "(12 . 13)");
+        let ast = e.build_ast().unwrap();
+        assert_eq!(ast.eval(basis()).unwrap().0.to_string(), "(12 . 13)");
 
         let input = Cursor::new("(pair (pair 12 13) 14)");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
-        assert_eq!(e.eval(basis()).unwrap().0.to_string(), "((12 . 13) . 14)");
+        let ast = e.build_ast().unwrap();
+        assert_eq!(ast.eval(basis()).unwrap().0.to_string(), "((12 . 13) . 14)");
 
         let input = Cursor::new("(pair 12 (pair 13 14))");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
-        assert_eq!(e.eval(basis()).unwrap().0.to_string(), "(12 . (13 . 14))");
+        let ast = e.build_ast().unwrap();
+        assert_eq!(ast.eval(basis()).unwrap().0.to_string(), "(12 . (13 . 14))");
     }
 }
