@@ -205,6 +205,10 @@ impl<R: BufRead> Stream<R> {
             }
         }
 
+        if c == '\'' {
+            return Ok(LO::Quote(Box::new(self.read_lo()?)));
+        }
+
         let mut s = "unexpected char: ".to_string();
         s.push(c);
         Err(End::Lisp(LispError::Parse(s)))
@@ -220,6 +224,7 @@ enum LO {
     Nil,
     Pair(Box<(LO, LO)>),
     Primitive(String, fn(&[&LO]) -> Result<LO, LispError>),
+    Quote(Box<LO>),
 }
 
 fn reverse_list(mut xs: LO) -> Result<LO, String> {
@@ -299,6 +304,8 @@ impl LO {
                         Ok(Expr::Apply(Box::new((func.build_ast()?, args.build_ast()?)))),
                     [sym, Symbol(n), e] if matches!(sym, Symbol(s) if s == "val") =>
                         Ok(Expr::Def(Box::new(Definition::Val(n.clone(), e.build_ast()?)))),
+                    [sym, e] if matches!(sym, Symbol(s) if s == "quote") =>
+                        Ok(Expr::Literal((*e).clone())),
                     [func, args @ ..] => {
                         let mut values = Vec::with_capacity(args.len());
                         for arg in args {
@@ -308,16 +315,8 @@ impl LO {
                     },
                 }
             },
-            Fixnum(_) | Bool(_) | Nil | Pair(_) => Ok(Expr::Literal(self.clone())),
+            Fixnum(_) | Bool(_) | Nil | Pair(_) | Quote(_) => Ok(Expr::Literal(self.clone())),
         }
-    }
-
-    fn list_to_pair(v: Vec<LO>) -> LO {
-        let mut acc = LO::Nil;
-        for lo in v.into_iter().rev() {
-            acc = LO::Pair(Box::new((lo, acc)));
-        }
-        acc
     }
 
     fn pair_to_list(&self) -> Vec<&LO> {
@@ -380,6 +379,7 @@ impl Expr {
 
         match self {
             Def(_) => unreachable!(),
+            Literal(LO::Quote(b)) => Ok(*b.clone()),
             Literal(l) => Ok(l.clone()),
             Var(n) => lookup(&n, env).map(|x| x.clone()),
             If(b) => match (*b).0.eval_expr(env)? {
@@ -410,15 +410,22 @@ impl Expr {
             Apply(b) => {
                 let f = (*b).0.eval_expr(env)?;
                 let arg = &(*b).1.eval_expr(env)?;
-                let primed = vec![arg];
-                match f {
-                    LO::Primitive(_, f) => f(primed.as_slice()),
-                    _ => {
-                        let s = "cannot apply to a non-primitive: '".to_string()
-                            + &f.to_string() + "'";
-                        Err(LispError::Type(s))
-                    },
+                if let LO::Pair(cell) = arg {
+                    let (v1, v2) = cell.as_ref();
+                    let primed = vec![v1, v2];
+                    return match f {
+                        LO::Primitive(_, f) => f(primed.as_slice()),
+                        _ => {
+                            let s = "cannot apply to a non-primitive: '".to_string()
+                                + &f.to_string() + "'";
+                            Err(LispError::Type(s))
+                        },
+                    }
                 }
+
+                let s = "cannot apply a non-pair '".to_string()
+                    + &arg.to_string() + "' to a primitive";
+                Err(LispError::Type(s))
             },
             Call(b) => {
                 if let (Expr::Var(name), true) = (&(*b).0, (*b).1.is_empty()) {
@@ -479,6 +486,7 @@ impl fmt::Display for LO {
                 write!(f, ")")
             },
             Primitive(name, _) => write!(f, "#<primitive:{name}>"),
+            Quote(q) => write!(f, "'{}", *q),
         }
     }
 }
@@ -583,10 +591,10 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use io::Cursor;
 
     #[test]
     fn read_char() {
-        use io::Cursor;
         let input = Cursor::new("hello  \n\t world");
         let mut s = Stream::new(input);
 
@@ -616,7 +624,6 @@ mod tests {
 
     #[test]
     fn test_pair_to_list() {
-        use io::Cursor;
         let input = Cursor::new("(1 2 3 4 5 350)");
         let mut s = Stream::new(input);
 
@@ -632,7 +639,6 @@ mod tests {
 
     #[test]
     fn unread_char() {
-        use io::Cursor;
         let input = Cursor::new("ab\nc");
         let mut s = Stream::new(input);
 
@@ -657,7 +663,6 @@ mod tests {
 
     #[test]
     fn parse_simples() {
-        use io::Cursor;
         let input = Cursor::new("   12   \n15 340 #t #f ~90 hello_world bear-lisp");
         let mut s = Stream::new(input);
 
@@ -679,17 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cons_from_vec() {
-        let a = LO::Fixnum(45);
-        let b = LO::Bool(false);
-        let c = LO::Symbol("hello-world".to_string());
-        assert_eq!(LO::list_to_pair(vec![a, b, c]).to_string(), "(45 #f hello-world)")
-    }
-
-    #[test]
     fn eval() {
-        use io::Cursor;
-
         let input = Cursor::new("(if #t (if #t 1 2) 3)");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
@@ -724,8 +719,6 @@ mod tests {
 
     #[test]
     fn eval_basis() {
-        use io::Cursor;
-
         let input = Cursor::new("(+ 12 13)");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
@@ -753,8 +746,6 @@ mod tests {
 
     #[test]
     fn eval_env_form() {
-        use io::Cursor;
-
         let input = Cursor::new("(env)");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
@@ -764,5 +755,26 @@ mod tests {
         let (result, env_prime) = ast.eval(env.clone()).unwrap();
         assert_eq!(result.to_string(), env.to_string());
         assert_eq!(env_prime.to_string(), env.to_string());
+    }
+
+    #[test]
+    fn eval_applications_and_quotes() {
+        let input = Cursor::new("(apply + (list 13 14))");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+
+        let env = basis();
+        let (result, _) = ast.eval(env).unwrap();
+        assert_eq!(result, LO::Fixnum(27));
+
+        let input = Cursor::new("(apply + '((if #t ~12 13) 14))");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+
+        let env = basis();
+        let (result, _) = ast.eval(env).unwrap();
+        assert_eq!(result, LO::Fixnum(2));
     }
 }
