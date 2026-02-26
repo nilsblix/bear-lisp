@@ -183,7 +183,7 @@ impl<R: BufRead> Stream<R> {
 }
 
 /// Left-object
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 enum LO {
     Fixnum(i64),
     Bool(bool),
@@ -276,24 +276,90 @@ fn lookup<'a>(name: &str, env: &'a LO) -> Option<&'a LO> {
     }
 }
 
-fn repl<R: BufRead>(stream: &mut Stream<R>) -> io::Result<()> {
+impl LO {
+    /// Returns the result and a modified env, in case the evaluation has side-effects.
+    fn eval(&self, env: LO) -> Result<(LO, LO), String> {
+        use LO::*;
+
+        match self {
+            Fixnum(_) => Ok((self.clone(), env)),
+            Bool(_) => Ok((self.clone(), env)),
+            Symbol(_) => Ok((self.clone(), env)),
+            Nil => Ok((self.clone(), env)),
+            Pair(cell) => {
+                let (head, tail) = cell.as_ref();
+                let Symbol(sym) = head else { return Ok((self.clone(), env)); };
+                if sym != "if" {
+                    return Ok((self.clone(), env));
+                }
+
+                let Pair(t1) = tail else { return Ok((self.clone(), env)); };
+                let (cond, rest) = t1.as_ref();
+
+                let Pair(t2) = rest else { return Ok((self.clone(), env)); };
+                let (if_true, rest) = t2.as_ref();
+
+                let Pair(t3) = rest else { return Ok((self.clone(), env)); };
+                let (if_false, rest) = t3.as_ref();
+
+                if *rest != Nil {
+                    let mut s = "unexpected tokens after else-branch, found: ".to_string();
+                    s += &rest.to_string();
+                    return Err(s);
+                }
+
+                let (cond_val, env) = cond.eval(env)?;
+
+                match cond_val {
+                    Bool(true) => if_true.eval(env),
+                    Bool(false) => if_false.eval(env),
+                    _ => {
+                        let mut s = "expected bool in if condition, found: ".to_string();
+                        s += &cond_val.to_string();
+                        return Err(s);
+                    },
+                }
+            },
+        }
+    }
+}
+
+fn repl<R: BufRead>(stream: &mut Stream<R>, env: LO) -> io::Result<()> {
+    let mut e = env;
     loop {
         print!("> ");
         _ = io::stdout().flush()?;
 
-        match stream.read_lo() {
-            Ok(lo) => println!("{lo}"),
+        let expr = match stream.read_lo() {
+            Ok(lo) => lo,
             Err(End::Eof) => break,
-            Err(End::ParseError(e)) => println!("error: {e}"),
-            Err(End::Io(e)) => println!("error: io: {e}"),
-        }
+            Err(End::ParseError(e)) => {
+                println!("error: parse: {e}");
+                continue;
+            }
+            Err(End::Io(e)) => {
+                println!("error: io: {e}");
+                continue;
+            },
+        };
+
+        let (result, env_prime) = match expr.eval(e.clone()) {
+            Ok(x) => x,
+            Err(e) => {
+                println!("error: eval: {e}");
+                continue;
+            },
+        };
+        e = env_prime;
+
+        println!("{result}");
     }
     Ok(())
 }
 
 fn main() -> io::Result<()> {
     let mut stream = Stream::new(io::stdin().lock());
-    repl(&mut stream)?;
+    repl(&mut stream, LO::Nil)?;
     Ok(())
 }
 
@@ -377,5 +443,20 @@ mod tests {
         let mut s = Stream::new(input);
         assert_eq!(s.read_lo().unwrap().to_string(), "(1 2 hello world)");
         assert_eq!(s.read_lo().unwrap().to_string(), "(34 (35 some))");
+    }
+
+    #[test]
+    fn eval() {
+        use io::Cursor;
+
+        let input = Cursor::new("(if #t (if #t 1 2) 3)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        assert_eq!(e.eval(LO::Nil).unwrap().0.to_string(), "1");
+
+        let input = Cursor::new("(if #f (if #t 1 2) (if #t (34 35) 12))");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        assert_eq!(e.eval(LO::Nil).unwrap().0.to_string(), "(34 35)");
     }
 }
