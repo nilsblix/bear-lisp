@@ -423,9 +423,13 @@ impl Expr {
                     },
                 }
             },
-            Call(b) if matches!((*b).0.eval_expr(env)?, LO::Symbol(s) if s == "env") =>
-                Ok(env.clone()),
             Call(b) => {
+                if let (Expr::Var(name), true) = (&(*b).0, (*b).1.is_empty()) {
+                    if name == "env" {
+                        return Ok(env.clone());
+                    }
+                }
+
                 let f = (*b).0.eval_expr(env)?;
 
                 let args = &(*b).1;
@@ -738,5 +742,20 @@ mod tests {
         let e = s.read_lo().unwrap();
         let ast = e.build_ast().unwrap();
         assert_eq!(ast.eval(basis()).unwrap().0.to_string(), "(12 . (13 . 14))");
+    }
+
+    #[test]
+    fn eval_env_form() {
+        use io::Cursor;
+
+        let input = Cursor::new("(env)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+
+        let env = basis();
+        let (result, env_prime) = ast.eval(env.clone()).unwrap();
+        assert_eq!(result.to_string(), env.to_string());
+        assert_eq!(env_prime.to_string(), env.to_string());
     }
 }
