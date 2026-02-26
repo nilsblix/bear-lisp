@@ -277,6 +277,67 @@ fn lookup<'a>(name: &str, env: &'a LO) -> Option<&'a LO> {
 }
 
 impl LO {
+    fn eval_if_form(&self, tail: &LO, env: LO) -> Result<(LO, LO), String> {
+        use LO::*;
+
+        let (cond, if_true, if_false, rest) = match tail {
+            Pair(t1) => match t1.as_ref() {
+                (cond, Pair(t2)) => match t2.as_ref() {
+                    (if_true, Pair(t3)) => {
+                        let (if_false, rest) = t3.as_ref();
+                        (cond, if_true, if_false, rest)
+                    },
+                    _ => return Ok((self.clone(), env)),
+                },
+                _ => return Ok((self.clone(), env)),
+            },
+            _ => return Ok((self.clone(), env)),
+        };
+
+        if *rest != Nil {
+            let mut s = "unexpected tokens after else-branch, found: ".to_string();
+            s += &rest.to_string();
+            return Err(s);
+        }
+
+        let (cond_val, env) = cond.eval(env)?;
+
+        match cond_val {
+            Bool(true) => if_true.eval(env),
+            Bool(false) => if_false.eval(env),
+            _ => {
+                let mut s = "expected bool in if condition, found: ".to_string();
+                s += &cond_val.to_string();
+                Err(s)
+            },
+        }
+    }
+
+    fn eval_val_form(&self, tail: &LO, env: LO) -> Result<(LO, LO), String> {
+        use LO::*;
+
+        let (name, val, rest) = match tail {
+            Pair(t1) => match t1.as_ref() {
+                (Symbol(name), Pair(t2)) => {
+                    let (value, rest) = t2.as_ref();
+                    (name, value, rest)
+                },
+                _ => return Ok((self.clone(), env)),
+            },
+            _ => return Ok((self.clone(), env)),
+        };
+
+        if *rest != Nil {
+            let mut s = "unexpected tokens after val bind, found: ".to_string();
+            s += &rest.to_string();
+            return Err(s);
+        }
+
+        let (val_prime, env) = val.eval(env)?;
+        let env_prime = bind(name.to_string(), val_prime.clone(), env);
+        Ok((val_prime, env_prime))
+    }
+
     /// Returns the result and a modified env, in case the evaluation has side-effects.
     fn eval(&self, env: LO) -> Result<(LO, LO), String> {
         use LO::*;
@@ -284,40 +345,26 @@ impl LO {
         match self {
             Fixnum(_) => Ok((self.clone(), env)),
             Bool(_) => Ok((self.clone(), env)),
-            Symbol(_) => Ok((self.clone(), env)),
+            Symbol(name) => {
+                let value = match lookup(name, &env) {
+                    Some(x) => x,
+                    None => {
+                        let mut s = "did not find ".to_string();
+                        s += &name.to_string();
+                        s += " in env";
+                        return Err(s);
+                    },
+                };
+
+                Ok((value.clone(), env))
+            }
             Nil => Ok((self.clone(), env)),
             Pair(cell) => {
                 let (head, tail) = cell.as_ref();
-                let Symbol(sym) = head else { return Ok((self.clone(), env)); };
-                if sym != "if" {
-                    return Ok((self.clone(), env));
-                }
-
-                let Pair(t1) = tail else { return Ok((self.clone(), env)); };
-                let (cond, rest) = t1.as_ref();
-
-                let Pair(t2) = rest else { return Ok((self.clone(), env)); };
-                let (if_true, rest) = t2.as_ref();
-
-                let Pair(t3) = rest else { return Ok((self.clone(), env)); };
-                let (if_false, rest) = t3.as_ref();
-
-                if *rest != Nil {
-                    let mut s = "unexpected tokens after else-branch, found: ".to_string();
-                    s += &rest.to_string();
-                    return Err(s);
-                }
-
-                let (cond_val, env) = cond.eval(env)?;
-
-                match cond_val {
-                    Bool(true) => if_true.eval(env),
-                    Bool(false) => if_false.eval(env),
-                    _ => {
-                        let mut s = "expected bool in if condition, found: ".to_string();
-                        s += &cond_val.to_string();
-                        return Err(s);
-                    },
+                match head {
+                    Symbol(sym) if sym == "if" =>  self.eval_if_form(tail, env),
+                    Symbol(sym) if sym == "val" => self.eval_val_form(tail, env),
+                    _ => Ok((self.clone(), env)),
                 }
             },
         }
@@ -458,5 +505,22 @@ mod tests {
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
         assert_eq!(e.eval(LO::Nil).unwrap().0.to_string(), "(34 35)");
+
+        let env = LO::Nil;
+
+        let input = Cursor::new("(val x #t)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let (res, env) = e.eval(env).unwrap();
+        assert_eq!(res.to_string(), "#t");
+
+        let input = Cursor::new("(val y (if x ~12 13))");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let (res, env) = e.eval(env).unwrap();
+        assert_eq!(res.to_string(), "-12");
+
+        assert_eq!(lookup("x", &env), Some(&LO::Bool(true)));
+        assert_eq!(lookup("y", &env), Some(&LO::Fixnum(-12)));
     }
 }
