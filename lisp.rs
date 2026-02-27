@@ -300,9 +300,13 @@ impl Env {
         }
 
         let add = bin_fixnum_prim!("+", LO::Fixnum, +);
-        let eql = bin_fixnum_prim!("=", LO::Bool, ==);
         let sub = bin_fixnum_prim!("-", LO::Fixnum, -);
         let mult = bin_fixnum_prim!("*", LO::Fixnum, *);
+
+        let eq = Primitive("eq".to_string(), |args| {
+            num_args("eq", 2, args)?;
+            Ok(LO::Bool(args[0] == args[1]))
+        });
 
         let pair = Primitive("pair".to_string(), |args| {
             num_args("pair", 2, args)?;
@@ -322,7 +326,7 @@ impl Env {
 
         let env = Env::new();
         let env = env.bind("+".to_string(), add);
-        let env = env.bind("=".to_string(), eql);
+        let env = env.bind("eq".to_string(), eq);
         let env = env.bind("-".to_string(), sub);
         let env = env.bind("*".to_string(), mult);
         let env = env.bind("pair".to_string(), pair);
@@ -874,6 +878,28 @@ mod tests {
         let e = s.read_lo().unwrap();
         let ast = e.build_ast().unwrap();
         assert_eq!(ast.eval(Env::basis()).unwrap().0.to_string(), "(12 . (13 . 14))");
+
+        let input = Cursor::new("(eq ((lambda (x) (+ x 1)) 10) 11)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+        assert_eq!(ast.eval(Env::basis()).unwrap().0.to_string(), "#t");
+
+        let input = Cursor::new("(eq ((lambda (x) (+ x 1)) 10) 12)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+        assert_eq!(ast.eval(Env::basis()).unwrap().0.to_string(), "#f");
+
+        // NOTE: should stuff like this be allowed? currently the program experiences stack overflow
+        // when trying to compare functions stored in an env.
+        //
+        // Also trying to implement alpha equivalence might be weird.
+        // let input = Cursor::new("(eq (lambda (x) (x + 1)) (lambda (y) (y + 1)))");
+        // let mut s = Stream::new(input);
+        // let e = s.read_lo().unwrap();
+        // let ast = e.build_ast().unwrap();
+        // assert_eq!(ast.eval(Env::basis()).unwrap().0.to_string(), "#t");
     }
 
     #[test]
@@ -949,7 +975,7 @@ mod tests {
     fn define_and_eval_function() {
         let env = Env::basis();
 
-        let input = Cursor::new("(define f (x) (if (= x 0) 1 (* x (f (+ x ~1)))))");
+        let input = Cursor::new("(define f (x) (if (eq x 0) 1 (* x (f (+ x ~1)))))");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
         let ast = e.build_ast().unwrap();
