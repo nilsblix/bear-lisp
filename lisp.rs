@@ -235,6 +235,11 @@ impl Env {
         self
     }
 
+    fn bind_box(mut self, name: String, b: Box<Option<LO>>) -> Self {
+        self.items.push((name, b));
+        self
+    }
+
     fn make_loc() -> Box<Option<LO>> {
         Box::new(None)
     }
@@ -252,7 +257,7 @@ impl Env {
             return Err(LispError::Env(s));
         }
 
-        for (n, v) in self.items.iter() {
+        for (n, v) in self.items.iter().rev() {
             if name == n {
                 match v.as_ref() {
                     Some(v_prime) => return Ok(v_prime),
@@ -283,11 +288,21 @@ impl Env {
 
         let add = Primitive("+".to_string(), |args| {
             num_args("+", 2, args)?;
-
             if let (LO::Fixnum(a), LO::Fixnum(b)) = (args[0], args[1]) {
                 Ok(LO::Fixnum(a + b))
             } else {
                 let s = "'+' primitive takes integer arguments, found: '".to_string()
+                    + &args[0].to_string() + "' and '" + &args[1].to_string() + "'";
+                Err(LispError::Type(s))
+            }
+        });
+
+        let eql = Primitive("=".to_string(), |args| {
+            num_args("=", 2, args)?;
+            if let (LO::Fixnum(a), LO::Fixnum(b)) = (args[0], args[1]) {
+                Ok(LO::Bool(a == b))
+            } else {
+                let s = "'=' primitive takes integer arguments, found: '".to_string()
                     + &args[0].to_string() + "' and '" + &args[1].to_string() + "'";
                 Err(LispError::Type(s))
             }
@@ -311,6 +326,7 @@ impl Env {
 
         let env = Env::new();
         let env = env.bind("+".to_string(), add);
+        let env = env.bind("=".to_string(), eql);
         let env = env.bind("pair".to_string(), pair);
         let env = env.bind("list".to_string(), list);
         env
@@ -406,7 +422,24 @@ impl LO {
                                 },
                             })
                             .collect();
-                        Ok(Expr::Lambda(formals?, Box::new(e.build_ast()?)))
+                        let ast = e.build_ast()?;
+                        Ok(Expr::Lambda(formals?, Box::new(ast)))
+                    },
+                    [sym, Symbol(n), ns, e] if matches!(sym, Symbol(s) if s == "define") => {
+                        let formals: Result<Vec<String>, LispError> = ns
+                            .pair_to_list()
+                            .into_iter()
+                            .map(|l| match l {
+                                Symbol(s) => Ok(s.clone()),
+                                _ => {
+                                    let s = "arguments to lambda can only be symbols, found: '".to_string()
+                                        + &l.to_string() + "'";
+                                    Err(LispError::Type(s))
+                                },
+                            })
+                            .collect();
+                        let ast = e.build_ast()?;
+                        Ok(Expr::Def(Box::new(Definition::Fun(n.clone(), formals?, ast))))
                     },
                     [func, args @ ..] => {
                         let mut values = Vec::with_capacity(args.len());
@@ -463,6 +496,7 @@ enum Expr {
 #[derive(Debug, PartialEq, Clone)]
 enum Definition {
     Val(String, Expr),
+    Fun(String, Vec<String>, Expr),
     Expr(Expr),
 }
 
@@ -481,6 +515,21 @@ impl Expr {
                 let v = e.eval_expr(&env)?;
                 let env_prime = env.bind(n.clone(), v.clone());
                 Ok((v, env_prime))
+            },
+            Definition::Fun(n, ns, e) => {
+                let lambda = Expr::Lambda(ns.clone(), Box::new(e.clone()));
+                let (formals, body, cl_env) = match lambda.eval_expr(&env)? {
+                    LO::Closure(fs, body, env) => (fs, body, env),
+                    lo => {
+                        let s = "expected a closure to define a function, found: '".to_string()
+                            + &lo.to_string() + "'";
+                        return Err(LispError::Type(s));
+                    }
+                };
+                let mut loc = Env::make_loc();
+                let clo = LO::Closure(formals, body, cl_env.bind_loc(n.to_string(), *loc));
+                *loc = Some(clo.clone());
+                Ok((clo, env.bind_box(n.to_string(), loc)))
             },
             Definition::Expr(e) => Ok((e.eval_expr(&env)?, env)),
         }
@@ -896,5 +945,25 @@ mod tests {
 
         let (res, _) = ast.eval(env).unwrap();
         assert_eq!(res, LO::Fixnum(-87));
+    }
+
+    #[test]
+    fn define_and_eval_function() {
+        let env = Env::basis();
+
+        let input = Cursor::new("(define f (x) (if (= x 0) 1 (f (+ x ~-1))))");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+
+        let (_, env) = ast.eval(env).unwrap();
+
+        let input = Cursor::new("(f 5)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+
+        let (res, _) = ast.eval(env).unwrap();
+        assert_eq!(res, LO::Fixnum(120));
     }
 }
