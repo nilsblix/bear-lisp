@@ -40,9 +40,9 @@ impl fmt::Display for LispError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use LispError::*;
         match self {
-            Parse(e) => write!(f, "{e}"),
-            Type(e) => write!(f, "{e}"),
-            Env(e) => write!(f, "{e}"),
+            Parse(e) => write!(f, "parse: {e}"),
+            Type(e) => write!(f, "type: {e}"),
+            Env(e) => write!(f, "env: {e}"),
         }
     }
 }
@@ -299,22 +299,22 @@ impl Env {
             };
         }
 
-        let add = bin_fixnum_prim!("+", LO::Fixnum, +);
-        let sub = bin_fixnum_prim!("-", LO::Fixnum, -);
-        let mult = bin_fixnum_prim!("*", LO::Fixnum, *);
+        let prim_add = bin_fixnum_prim!("+", LO::Fixnum, +);
+        let prim_sub = bin_fixnum_prim!("-", LO::Fixnum, -);
+        let prim_mult = bin_fixnum_prim!("*", LO::Fixnum, *);
 
-        let eq = Primitive("eq".to_string(), |args| {
+        let prim_eq = Primitive("eq".to_string(), |args| {
             num_args("eq", 2, args)?;
             Ok(LO::Bool(args[0] == args[1]))
         });
 
-        let pair = Primitive("pair".to_string(), |args| {
+        let prim_pair = Primitive("pair".to_string(), |args| {
             num_args("pair", 2, args)?;
             Ok(LO::Pair(Box::new((args[0].clone(), args[1].clone()))))
         });
 
 
-        let list = Primitive("list".to_string(), |args| {
+        let prim_list = Primitive("list".to_string(), |args| {
             fn prim_list(args: &[&LO]) -> LO {
                 match args {
                     [] => LO::Nil,
@@ -324,13 +324,47 @@ impl Env {
             Ok(prim_list(args))
         });
 
+        let prim_car = Primitive("car".to_string(), |args| {
+            num_args("car", 1, args)?;
+            if let LO::Pair(p) = args[0] {
+                return Ok(p.0.clone());
+            }
+
+            let s = "'car' primitive expects a pair as argument, found: '".to_string()
+                + &args[0].to_string() + "'";
+            Err(LispError::Type(s))
+        });
+
+        let prim_cdr = Primitive("cdr".to_string(), |args| {
+            num_args("car", 1, args)?;
+            if let LO::Pair(p) = args[0] {
+                return Ok(p.1.clone());
+            }
+
+            let s = "'cdr' primitive expects a pair as argument, found: '".to_string()
+                + &args[0].to_string() + "'";
+            Err(LispError::Type(s))
+        });
+
+        let prim_atomp = Primitive("atom?".to_string(), |args| {
+            num_args("atom?", 1, args)?;
+            if let LO::Pair(_) = args[0] {
+                Ok(LO::Bool(false))
+            } else {
+                Ok(LO::Bool(true))
+            }
+        });
+
         let env = Env::new();
-        let env = env.bind("+".to_string(), add);
-        let env = env.bind("eq".to_string(), eq);
-        let env = env.bind("-".to_string(), sub);
-        let env = env.bind("*".to_string(), mult);
-        let env = env.bind("pair".to_string(), pair);
-        let env = env.bind("list".to_string(), list);
+        let env = env.bind("+".to_string(), prim_add);
+        let env = env.bind("eq".to_string(), prim_eq);
+        let env = env.bind("-".to_string(), prim_sub);
+        let env = env.bind("*".to_string(), prim_mult);
+        let env = env.bind("pair".to_string(), prim_pair);
+        let env = env.bind("list".to_string(), prim_list);
+        let env = env.bind("car".to_string(), prim_car);
+        let env = env.bind("cdr".to_string(), prim_cdr);
+        let env = env.bind("atom?".to_string(), prim_atomp);
         env
     }
 
@@ -698,16 +732,16 @@ fn repl<R: BufRead>(stream: &mut Stream<R>, env: Env) -> io::Result<()> {
 
         let ast = match expr.build_ast() {
             Ok(a) => a,
-            Err(Parse(e)) | Err(Type(e)) | Err(Env(e)) => {
-                println!("error: lisp: {e}");
+            Err(l) => {
+                println!("error: lisp: {l}");
                 continue;
             },
         };
 
         let (result, env_prime) = match ast.eval(e.clone()) {
             Ok(x) => x,
-            Err(Parse(e)) | Err(Type(e)) | Err(Env(e)) => {
-                println!("error: lisp: {e}");
+            Err(l) => {
+                println!("error: lisp: {l}");
                 continue;
             },
         };
