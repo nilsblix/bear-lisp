@@ -1,5 +1,7 @@
 use std::fmt;
 use std::io::{self, BufRead, Write};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 struct Stream<R: BufRead> {
     reader: R,
@@ -217,7 +219,7 @@ impl<R: BufRead> Stream<R> {
 
 #[derive(Debug, PartialEq, Clone)]
 struct Env {
-    items: Vec<(String, Box<Option<LO>>)>,
+    items: Vec<(String, Rc<RefCell<Option<LO>>>)>,
 }
 
 impl Env {
@@ -226,22 +228,17 @@ impl Env {
     }
 
     fn bind(mut self, name: String, value: LO) -> Self {
-        self.items.push((name, Box::new(Some(value))));
+        self.items.push((name, Rc::new(RefCell::new(Some(value)))));
         self
     }
 
-    fn bind_loc(mut self, name: String, value_opt: Option<LO>) -> Self {
-        self.items.push((name, Box::new(value_opt)));
-        self
-    }
-
-    fn bind_box(mut self, name: String, b: Box<Option<LO>>) -> Self {
+    fn bind_rc(mut self, name: String, b: Rc<RefCell<Option<LO>>>) -> Self {
         self.items.push((name, b));
         self
     }
 
-    fn make_loc() -> Box<Option<LO>> {
-        Box::new(None)
+    fn make_loc() -> Rc<RefCell<Option<LO>>> {
+        Rc::new(RefCell::new(None))
     }
 
     fn bind_list(mut self, names: Vec<String>, values: Vec<LO>) -> Self {
@@ -251,7 +248,7 @@ impl Env {
         self
     }
 
-    fn lookup<'a>(&'a self, name: &str) -> Result<&'a LO, LispError> {
+    fn lookup(&self, name: &str) -> Result<LO, LispError> {
         if self.items.is_empty() {
             let s = "could not find '".to_string() + name + "' in env due to empty env";
             return Err(LispError::Env(s));
@@ -259,8 +256,8 @@ impl Env {
 
         for (n, v) in self.items.iter().rev() {
             if name == n {
-                match v.as_ref() {
-                    Some(v_prime) => return Ok(v_prime),
+                match v.borrow().as_ref() {
+                    Some(v_prime) => return Ok(v_prime.clone()),
                     None => {
                         let s = "'".to_string() + name
                             + "' evaluated to an unspecified value in env";
@@ -286,27 +283,26 @@ impl Env {
             Ok(())
         }
 
-        let add = Primitive("+".to_string(), |args| {
-            num_args("+", 2, args)?;
-            if let (LO::Fixnum(a), LO::Fixnum(b)) = (args[0], args[1]) {
-                Ok(LO::Fixnum(a + b))
-            } else {
-                let s = "'+' primitive takes integer arguments, found: '".to_string()
-                    + &args[0].to_string() + "' and '" + &args[1].to_string() + "'";
-                Err(LispError::Type(s))
-            }
-        });
+        macro_rules! bin_fixnum_prim {
+            ($name:literal, $ctor:path, $op:tt) => {
+                Primitive($name.to_string(), |args| {
+                    num_args($name, 2, args)?;
+                    if let (LO::Fixnum(a), LO::Fixnum(b)) = (args[0], args[1]) {
+                        Ok($ctor(a $op b))
+                    } else {
+                        let s = "'".to_string() + $name
+                            + "' primitive takes integer arguments, found: '"
+                            + &args[0].to_string() + "' and '" + &args[1].to_string() + "'";
+                        Err(LispError::Type(s))
+                    }
+                })
+            };
+        }
 
-        let eql = Primitive("=".to_string(), |args| {
-            num_args("=", 2, args)?;
-            if let (LO::Fixnum(a), LO::Fixnum(b)) = (args[0], args[1]) {
-                Ok(LO::Bool(a == b))
-            } else {
-                let s = "'=' primitive takes integer arguments, found: '".to_string()
-                    + &args[0].to_string() + "' and '" + &args[1].to_string() + "'";
-                Err(LispError::Type(s))
-            }
-        });
+        let add = bin_fixnum_prim!("+", LO::Fixnum, +);
+        let eql = bin_fixnum_prim!("=", LO::Bool, ==);
+        let sub = bin_fixnum_prim!("-", LO::Fixnum, -);
+        let mult = bin_fixnum_prim!("*", LO::Fixnum, *);
 
         let pair = Primitive("pair".to_string(), |args| {
             num_args("pair", 2, args)?;
@@ -327,6 +323,8 @@ impl Env {
         let env = Env::new();
         let env = env.bind("+".to_string(), add);
         let env = env.bind("=".to_string(), eql);
+        let env = env.bind("-".to_string(), sub);
+        let env = env.bind("*".to_string(), mult);
         let env = env.bind("pair".to_string(), pair);
         let env = env.bind("list".to_string(), list);
         env
@@ -336,7 +334,7 @@ impl Env {
         let los: Vec<LO> = self.items
             .iter()
             .map(|(n, v)|
-                LO::Pair(Box::new((LO::Symbol(n.clone()), match v.as_ref() {
+                LO::Pair(Box::new((LO::Symbol(n.clone()), match v.borrow().as_ref() {
                     Some(lo) => lo.clone(),
                     None => LO::Symbol("#<unspecified value>".to_string()),
                 })))
@@ -526,10 +524,10 @@ impl Expr {
                         return Err(LispError::Type(s));
                     }
                 };
-                let mut loc = Env::make_loc();
-                let clo = LO::Closure(formals, body, cl_env.bind_loc(n.to_string(), *loc));
-                *loc = Some(clo.clone());
-                Ok((clo, env.bind_box(n.to_string(), loc)))
+                let loc = Env::make_loc();
+                let clo = LO::Closure(formals, body, cl_env.bind_rc(n.to_string(), loc.clone()));
+                *loc.borrow_mut() = Some(clo.clone());
+                Ok((clo, env.bind_rc(n.to_string(), loc)))
             },
             Definition::Expr(e) => Ok((e.eval_expr(&env)?, env)),
         }
@@ -543,7 +541,7 @@ impl Expr {
             Def(_) => unreachable!(),
             Literal(LO::Quote(b)) => Ok(*b.clone()),
             Literal(l) => Ok(l.clone()),
-            Var(n) => env.clone().lookup(&n).map(|x| x.clone()),
+            Var(n) => env.lookup(&n),
             If(b) => match (*b).0.eval_expr(env)? {
                 LO::Bool(true) => Ok((*b).1.eval_expr(env)?),
                 LO::Bool(false) => Ok((*b).2.eval_expr(env)?),
@@ -601,7 +599,7 @@ impl Expr {
                         let los: Vec<LO> = env.items
                             .iter()
                             .map(|(n, v)|
-                                LO::Pair(Box::new((LO::Symbol(n.clone()), match v.as_ref() {
+                                LO::Pair(Box::new((LO::Symbol(n.clone()), match v.borrow().as_ref() {
                                     Some(lo) => lo.clone(),
                                     None => LO::Symbol("#<unspecified value>".to_string()),
                                 })))
@@ -847,8 +845,8 @@ mod tests {
         let (res, env) = ast.eval(env).unwrap();
         assert_eq!(res.to_string(), "-12");
 
-        assert_eq!(env.lookup("x").unwrap(), &LO::Bool(true));
-        assert_eq!(env.lookup("y").unwrap(), &LO::Fixnum(-12));
+        assert_eq!(env.lookup("x").unwrap(), LO::Bool(true));
+        assert_eq!(env.lookup("y").unwrap(), LO::Fixnum(-12));
     }
 
     #[test]
@@ -951,19 +949,35 @@ mod tests {
     fn define_and_eval_function() {
         let env = Env::basis();
 
-        let input = Cursor::new("(define f (x) (if (= x 0) 1 (f (+ x ~-1))))");
+        let input = Cursor::new("(define f (x) (if (= x 0) 1 (* x (f (+ x ~1)))))");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
         let ast = e.build_ast().unwrap();
 
         let (_, env) = ast.eval(env).unwrap();
 
+        let input = Cursor::new("(f 4)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+
+        let (res, env) = ast.eval(env).unwrap();
+        assert_eq!(res, LO::Fixnum(24));
+
         let input = Cursor::new("(f 5)");
         let mut s = Stream::new(input);
         let e = s.read_lo().unwrap();
         let ast = e.build_ast().unwrap();
 
-        let (res, _) = ast.eval(env).unwrap();
+        let (res, env) = ast.eval(env).unwrap();
         assert_eq!(res, LO::Fixnum(120));
+
+        let input = Cursor::new("(f 6)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+
+        let (res, _) = ast.eval(env).unwrap();
+        assert_eq!(res, LO::Fixnum(720));
     }
 }
