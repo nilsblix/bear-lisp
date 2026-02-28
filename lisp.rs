@@ -356,6 +356,15 @@ impl Env {
             }
         });
 
+        let prim_symp = Primitive("sym?".to_string(), |args| {
+            num_args("sym?", 1, args)?;
+            if let LO::Symbol(_) = args[0] {
+                Ok(LO::Bool(true))
+            } else {
+                Ok(LO::Bool(false))
+            }
+        });
+
         let prim_add = bin_fixnum_prim!("+", LO::Fixnum, +);
         let prim_sub = bin_fixnum_prim!("-", LO::Fixnum, -);
         let prim_mult = bin_fixnum_prim!("*", LO::Fixnum, *);
@@ -376,6 +385,7 @@ impl Env {
         let env = env.bind("car".to_string(), prim_car);
         let env = env.bind("cdr".to_string(), prim_cdr);
         let env = env.bind("atom?".to_string(), prim_atomp);
+        let env = env.bind("sym?".to_string(), prim_symp);
         env
     }
 
