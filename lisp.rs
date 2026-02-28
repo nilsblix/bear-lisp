@@ -241,11 +241,15 @@ impl Env {
         Rc::new(RefCell::new(None))
     }
 
-    fn bind_list(mut self, names: Vec<String>, values: Vec<LO>) -> Self {
-        for (n, v) in names.iter().zip(values.iter()) {
+    fn bind_list(mut self, bindings: Vec<(String, LO)>) -> Self {
+        for (n, v) in bindings.iter() {
             self = self.bind(n.clone(), v.clone());
         }
         self
+        // for (n, v) in names.iter().zip(values.iter()) {
+        //     self = self.bind(n.clone(), v.clone());
+        // }
+        // self
     }
 
     fn lookup(&self, name: &str) -> Result<LO, LispError> {
@@ -437,6 +441,24 @@ fn reverse_list(mut xs: LO) -> Result<LO, String> {
     }
 }
 
+/// Most efficient when T is a reference, as clone might otherwise perform unecessary allocations.
+fn assert_unique<T: PartialEq + ToString + Clone>(d: &dyn ToString, xs: &[T]) -> Result<(), LispError> {
+    if xs.len() <= 1 {
+        return Ok(());
+    }
+
+    let x = xs[0].clone();
+    let xs = &xs[1..];
+    if xs.contains(&x) {
+        let e = "'".to_string() + &d.to_string()
+            + "' expects unique bindings, found multiple of: '"
+            + &x.to_string() + "'";
+        return Err(LispError::Parse(e));
+    }
+
+    Ok(())
+}
+
 impl LO {
     fn is_list(&self) -> bool {
         match self {
@@ -499,7 +521,7 @@ impl LO {
                         cond_to_if(conditions)
                     },
                     [sym, ns, e] if ns.is_list() && matches!(sym, Symbol(s) if s == "lambda") => {
-                        let formals: Result<Vec<String>, LispError> = ns
+                        let formals = ns
                             .pair_to_list()
                             .into_iter()
                             .map(|l| match l {
@@ -510,12 +532,13 @@ impl LO {
                                     Err(LispError::Type(s))
                                 },
                             })
-                            .collect();
+                            .collect::<Result<Vec<String>, LispError>>()?;
+                        assert_unique(&"lambda", formals.as_slice())?;
                         let ast = e.build_ast()?;
-                        Ok(Expr::Lambda(formals?, Box::new(ast)))
+                        Ok(Expr::Lambda(formals, Box::new(ast)))
                     },
                     [sym, Symbol(n), ns, e] if matches!(sym, Symbol(s) if s == "define") => {
-                        let formals: Result<Vec<String>, LispError> = ns
+                        let formals = ns
                             .pair_to_list()
                             .into_iter()
                             .map(|l| match l {
@@ -526,9 +549,40 @@ impl LO {
                                     Err(LispError::Type(s))
                                 },
                             })
-                            .collect();
+                            .collect::<Result<Vec<String>, LispError>>()?;
+                        assert_unique(&"define", formals.as_slice())?;
                         let ast = e.build_ast()?;
-                        Ok(Expr::Def(Box::new(Definition::Fun(n.clone(), formals?, ast))))
+                        Ok(Expr::Def(Box::new(Definition::Fun(n.clone(), formals, ast))))
+                    },
+                    [Symbol(s), bindings, exp] if bindings.is_list() && Lets::is_valid(s) => {
+                        let l = Lets::map(s).unwrap();
+
+                        fn make_binding(b: &LO) -> Result<(String, Expr), LispError> {
+                            if let Pair(b) = b {
+                                if let (Symbol(n), Pair(b)) = b.as_ref() {
+                                    if let (e, Nil) = b.as_ref() {
+                                        return Ok((n.clone(), e.build_ast()?));
+                                    }
+                                }
+                            }
+
+                            let s = "binding expects (name as), found: '".to_string()
+                                + &b.to_string() + "'";
+                            Err(LispError::Parse(s))
+                        }
+
+                        let bindings = bindings
+                            .pair_to_list()
+                            .iter()
+                            .map(|b| make_binding(*b))
+                            .collect::<Result<Vec<(String, Expr)>, LispError>>()?;
+
+                        assert_unique(&l, &bindings.iter().map(|x| x.0.as_str()).collect::<Vec<&str>>().as_slice())?;
+                        let bindings = bindings
+                            .iter()
+                            .map(|x| (x.to_owned().0, Box::new(x.to_owned().1)))
+                            .collect::<Vec<(String, Box<Expr>)>>();
+                        Ok(Expr::Let(l, bindings, Box::new(exp.build_ast()?)))
                     },
                     [func, args @ ..] => {
                         let mut values = Vec::with_capacity(args.len());
@@ -579,7 +633,41 @@ enum Expr {
     Apply(Box<(Expr, Expr)>),
     Call(Box<(Expr, Vec<Expr>)>),
     Lambda(Vec<String>, Box<Expr>),
+    /// (kind, bindings, in)
+    Let(Lets, Vec<(String, Box<Expr>)>, Box<Expr>),
     Def(Box<Definition>),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum Lets {
+    Fixed, Star, Rec,
+}
+
+impl Lets {
+    fn is_valid(s: &str) -> bool {
+        Lets::map(s).is_some()
+    }
+
+    fn map(s: &str) -> Option<Lets> {
+        use Lets::*;
+        match s {
+            "let" => Some(Fixed),
+            "let*" => Some(Star),
+            "letrec" => Some(Rec),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Lets {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use Lets::*;
+        match self {
+            Fixed => write!(f, "let"),
+            Star => write!(f, "let*"),
+            Rec => write!(f, "letrec"),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -587,6 +675,19 @@ enum Definition {
     Val(String, Expr),
     Fun(String, Vec<String>, Expr),
     Expr(Expr),
+}
+
+fn eval_bindings(
+    bindings: &Vec<(String, Box<Expr>)>,
+    env: &Env
+) -> Result<Vec<(String, LO)>, LispError> {
+    bindings
+        .iter()
+        .map(|(name, expr)| {
+            let value = expr.eval_expr(env)?;
+            Ok((name.clone(), value))
+        })
+        .collect()
 }
 
 impl Expr {
@@ -643,16 +744,16 @@ impl Expr {
                 },
             },
             And(b) => match ((*b).0.eval_expr(env)?, (*b).1.eval_expr(env)?) {
-                | (LO::Bool(v1), LO::Bool(v2)) => Ok(LO::Bool(v1 && v2)),
-                | (v1, v2) => {
+                (LO::Bool(v1), LO::Bool(v2)) => Ok(LO::Bool(v1 && v2)),
+                (v1, v2) => {
                     let s = "and statement conditions did not resolve to bools, found: '".to_string()
                         + &v1.to_string() + "' and '" + &v2.to_string() + "'";
                     Err(LispError::Type(s))
                 },
             },
             Or(b) => match ((*b).0.eval_expr(env)?, (*b).1.eval_expr(env)?) {
-                | (LO::Bool(v1), LO::Bool(v2)) => Ok(LO::Bool(v1 || v2)),
-                | (v1, v2) => {
+                (LO::Bool(v1), LO::Bool(v2)) => Ok(LO::Bool(v1 || v2)),
+                (v1, v2) => {
                     let s = "or statement conditions did not resolve to bools, found: '".to_string()
                         + &v1.to_string() + "' and '" + &v2.to_string() + "'";
                     Err(LispError::Type(s))
@@ -701,6 +802,12 @@ impl Expr {
                 Expr::eval_apply(env.clone(), f, primed)
             },
             Lambda(ns, e) => Ok(LO::Closure(ns.clone(), e.clone(), env.clone())),
+            Let(Lets::Fixed, bindings, body) => {
+                let mapped = eval_bindings(bindings, env)?;
+                body.eval_expr(&env.clone().bind_list(mapped))
+            },
+            Let(Lets::Star, _bindings, _body) => panic!("unimplemented"),
+            Let(Lets::Rec, _bindings, _body) => panic!("unimplemented"),
         }
     }
 
@@ -708,7 +815,11 @@ impl Expr {
         match f {
             LO::Primitive(_, f) => f(values.iter().collect::<Vec<&LO>>().as_slice()),
             LO::Closure(ns, e, cl_env) => {
-                let combined = env.extend(&mut cl_env.bind_list(ns, values));
+                let params: Vec<(String, LO)> = ns
+                    .into_iter()
+                    .zip(values.into_iter())
+                    .collect();
+                let combined = env.extend(&mut cl_env.bind_list(params));
                 e.eval_expr(&combined)
             },
             _ => {
@@ -1126,5 +1237,43 @@ mod tests {
         let (res, _) = ast_cond.eval(env).unwrap();
         assert_eq!(res.to_string(), "higher".to_string());
 
+    }
+
+    #[test]
+    fn let_regular() {
+        let env = Env::basis();
+
+
+        let def_f = Cursor::new("(define f(x) (cond ((< x 4) 'lower)
+                                      ((= x 4) 'equal)
+                                      ((> x 4) 'higher)))");
+        let mut s = Stream::new(def_f);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+        let (_, env) = ast.eval(env).unwrap();
+
+        let input = Cursor::new("(let ((x 5)) (f x))");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+        let (res, env) = ast.eval(env).unwrap();
+
+        assert_eq!(res.to_string(), "higher");
+
+        let input = Cursor::new("(let ((z 4)) (f z))");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+        let (res, env) = ast.eval(env).unwrap();
+
+        assert_eq!(res.to_string(), "equal");
+
+        let input = Cursor::new("(let ((value 3)) (f value))");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+        let (res, _env) = ast.eval(env).unwrap();
+
+        assert_eq!(res.to_string(), "lower");
     }
 }
