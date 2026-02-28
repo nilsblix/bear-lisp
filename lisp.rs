@@ -211,8 +211,7 @@ impl<R: BufRead> Stream<R> {
             return Ok(LO::Quote(Box::new(self.read_lo()?)));
         }
 
-        let mut s = "unexpected char: ".to_string();
-        s.push(c);
+        let s = format!("unexpected char: {}", c);
         Err(End::Lisp(LispError::Parse(s)))
     }
 }
@@ -273,7 +272,7 @@ impl Env {
             }
         }
 
-        let s = "could not find '".to_string() + name + "' in env";
+        let s = format!("could not find '{}' in env", name);
         return Err(LispError::Env(s));
     }
 
@@ -281,8 +280,8 @@ impl Env {
         use LO::Primitive;
         fn num_args(name: &str, n: usize, args: &[&LO]) -> Result<(), LispError> {
             if args.len() != n {
-                let s = "'".to_string() + name + "' primitive takes " + &n.to_string()
-                    + " arguments, found: " + &args.len().to_string();
+                let s = format!("'{}' primitive expects '{}' number of arguments, found, '{}'" ,
+                    name, n, args.len());
                 return Err(LispError::Type(s));
             }
 
@@ -296,9 +295,8 @@ impl Env {
                     if let (LO::Fixnum(a), LO::Fixnum(b)) = (args[0], args[1]) {
                         Ok($ctor(a $op b))
                     } else {
-                        let s = "'".to_string() + $name
-                            + "' primitive takes integer arguments, found: '"
-                            + &args[0].to_string() + "' and '" + &args[1].to_string() + "'";
+                        let s = format!("'{}' primitive expects integer arguments, found '{}' and '{}'",
+                            $name, args[0], args[1]);
                         Err(LispError::Type(s))
                     }
                 })
@@ -332,8 +330,7 @@ impl Env {
                 return Ok(p.0.clone());
             }
 
-            let s = "'car' primitive expects a pair as argument, found: '".to_string()
-                + &args[0].to_string() + "'";
+            let s = format!("'car' primitive expects a pair as argument, found: '{}'", args[0]);
             Err(LispError::Type(s))
         });
 
@@ -343,8 +340,7 @@ impl Env {
                 return Ok(p.1.clone());
             }
 
-            let s = "'cdr' primitive expects a pair as argument, found: '".to_string()
-                + &args[0].to_string() + "'";
+            let s = format!("'cdr' primitive expects a pair as argument, found: '{}'", args[0]);
             Err(LispError::Type(s))
         });
 
@@ -439,7 +435,7 @@ fn reverse_list(mut xs: LO) -> Result<LO, String> {
 }
 
 /// Most efficient when T is a reference, as clone might otherwise perform unecessary allocations.
-fn assert_unique<T: PartialEq + ToString + Clone>(d: &dyn ToString, xs: &[T]) -> Result<(), LispError> {
+fn assert_unique<T: PartialEq + fmt::Display + Clone>(d: &dyn fmt::Display, xs: &[T]) -> Result<(), LispError> {
     if xs.len() <= 1 {
         return Ok(());
     }
@@ -447,9 +443,8 @@ fn assert_unique<T: PartialEq + ToString + Clone>(d: &dyn ToString, xs: &[T]) ->
     let x = xs[0].clone();
     let xs = &xs[1..];
     if xs.contains(&x) {
-        let e = "'".to_string() + &d.to_string()
-            + "' expects unique bindings, found multiple of: '"
-            + &x.to_string() + "'";
+        let e = format!("'{}' expects unique bindings, found multiple of '{}'",
+            d, x);
         return Err(LispError::Parse(e));
     }
 
@@ -488,7 +483,7 @@ impl LO {
                     [sym, conditions @ ..] if matches!(sym, Symbol(s) if s == "cond") => {
                         fn cond_to_if(xs: &[&LO]) -> Result<Expr, LispError> {
                             if xs.is_empty() {
-                                let s = "'cond' takes a list of conditions, found nothing".to_string();
+                                let s = "'cond' expects a list of conditions, found nothing".to_string();
                                 return Err(LispError::Parse(s));
                             }
 
@@ -510,8 +505,7 @@ impl LO {
                                 }
                             }
 
-                            let s = "'cond' takes a list of conditions, found '".to_string()
-                                + &xs[0].to_string() + "'";
+                            let s = format!("'cond' expects a list of conditions, found '{}'", xs[0]);
                             Err(LispError::Parse(s))
                         }
 
@@ -524,8 +518,7 @@ impl LO {
                             .map(|l| match l {
                                 Symbol(s) => Ok(s.clone()),
                                 _ => {
-                                    let s = "arguments to lambda can only be symbols, found: '".to_string()
-                                        + &l.to_string() + "'";
+                                    let s = format!("arguments to lambda can only be symbols, found: '{}'", l);
                                     Err(LispError::Type(s))
                                 },
                             })
@@ -541,8 +534,7 @@ impl LO {
                             .map(|l| match l {
                                 Symbol(s) => Ok(s.clone()),
                                 _ => {
-                                    let s = "arguments to lambda can only be symbols, found: '".to_string()
-                                        + &l.to_string() + "'";
+                                    let s = format!("arguments to lambda can only be symbols, found: '{}'", l);
                                     Err(LispError::Type(s))
                                 },
                             })
@@ -563,8 +555,7 @@ impl LO {
                                 }
                             }
 
-                            let s = "binding expects (name as), found: '".to_string()
-                                + &b.to_string() + "'";
+                            let s = format!("binding expects '(name as)', found: '{}'", b);
                             Err(LispError::Parse(s))
                         }
 
@@ -721,8 +712,7 @@ impl Expr {
                 let (formals, body, cl_env) = match lambda.eval_expr(&env)? {
                     LO::Closure(fs, body, env) => (fs, body, env),
                     lo => {
-                        let s = "expected a closure to define a function, found: '".to_string()
-                            + &lo.to_string() + "'";
+                        let s = format!("expected a closure to define a function, found: '{}'", lo);
                         return Err(LispError::Type(s));
                     }
                 };
@@ -748,24 +738,23 @@ impl Expr {
                 LO::Bool(true) => Ok((*b).1.eval_expr(env)?),
                 LO::Bool(false) => Ok((*b).2.eval_expr(env)?),
                 other => {
-                    let s = "if statement condition did not resolve to a bool, found: '".to_string()
-                        + &other.to_string() + "'";
+                    let s = format!("if statement condition did not resolve to a bool, found: '{}'", other);
                     Err(LispError::Type(s))
                 },
             },
             And(b) => match ((*b).0.eval_expr(env)?, (*b).1.eval_expr(env)?) {
                 (LO::Bool(v1), LO::Bool(v2)) => Ok(LO::Bool(v1 && v2)),
                 (v1, v2) => {
-                    let s = "and statement conditions did not resolve to bools, found: '".to_string()
-                        + &v1.to_string() + "' and '" + &v2.to_string() + "'";
+                    let s = format!("and statement conditions did not resolve to bools, found: '{}' and '{}'",
+                        v1, v2);
                     Err(LispError::Type(s))
                 },
             },
             Or(b) => match ((*b).0.eval_expr(env)?, (*b).1.eval_expr(env)?) {
                 (LO::Bool(v1), LO::Bool(v2)) => Ok(LO::Bool(v1 || v2)),
                 (v1, v2) => {
-                    let s = "or statement conditions did not resolve to bools, found: '".to_string()
-                        + &v1.to_string() + "' and '" + &v2.to_string() + "'";
+                    let s = format!("or statement conditions did not resolve to bools, found: '{}' and '{}'",
+                        v1, v2);
                     Err(LispError::Type(s))
                 },
             },
@@ -773,8 +762,7 @@ impl Expr {
                 let f = (*b).0.eval_expr(env)?;
                 let arg_list = (*b).1.eval_expr(env)?;
                 if !arg_list.is_list() {
-                    let s = "cannot apply a non-list '".to_string()
-                        + &arg_list.to_string() + "' to a primitive";
+                    let s = format!("cannot apply a non-list '{}' to a primitive", arg_list);
                     return Err(LispError::Type(s));
                 }
 
@@ -850,21 +838,8 @@ impl Expr {
                     .collect();
                 e.eval_expr(&cl_env.bind_list(zipped))
             },
-            // FIXME: What does he mean by
-            // "It’s what we should have used in the last post, instead of adding that ugly hack to
-            // evalapply"?
-            //
-            // LO::Closure(ns, e, cl_env) => {
-            //     let params: Vec<(String, LO)> = ns
-            //         .into_iter()
-            //         .zip(values.into_iter())
-            //         .collect();
-            //     let combined = env.extend(&mut cl_env.bind_list(params));
-            //     e.eval_expr(&combined)
-            // },
             _ => {
-                let s = "tried to call a non-function, found: '".to_string()
-                    + &f.to_string() + "'";
+                let s = format!("tried to call a non-function, found: '{}'", f);
                 Err(LispError::Type(s))
             },
         }
@@ -961,11 +936,19 @@ mod tests {
     use super::*;
     use io::Cursor;
 
-    fn eval(env: Env, input: &str) -> (LO, Env) {
+    fn parse(input: &str) -> Result<LO, End> {
         let mut s = Stream::new(Cursor::new(input));
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        ast.eval(env).unwrap()
+        s.read_lo()
+    }
+
+    fn eval_result(env: Env, input: &str) -> Result<(LO, Env), LispError> {
+        let e = parse(input).unwrap();
+        let ast = e.build_ast()?;
+        ast.eval(env)
+    }
+
+    fn eval(env: Env, input: &str) -> (LO, Env) {
+        eval_result(env, input).unwrap()
     }
 
     #[test]
@@ -1059,6 +1042,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_errors() {
+        assert!(
+            matches!(parse("("), Err(End::Lisp(LispError::Parse(e))) if e.contains("unexpected eof in list"))
+        );
+        assert!(
+            matches!(parse(")"), Err(End::Lisp(LispError::Parse(e))) if e.contains("unexpected char"))
+        );
+    }
+
+    #[test]
     fn eval_forms() {
         assert_eq!(eval(Env::new(), "(if #t (if #t 1 2) 3)").0.to_string(), "1");
         assert_eq!(
@@ -1106,12 +1099,45 @@ mod tests {
     }
 
     #[test]
+    fn eval_error_paths() {
+        assert!(
+            matches!(
+                eval_result(Env::basis(), "(apply + 1)"),
+                Err(LispError::Type(e)) if e.contains("cannot apply a non-list")
+            )
+        );
+        assert!(
+            matches!(
+                eval_result(Env::basis(), "(1 2)"),
+                Err(LispError::Type(e)) if e.contains("tried to call a non-function")
+            )
+        );
+        assert!(
+            matches!(
+                eval_result(Env::basis(), "(if 1 2 3)"),
+                Err(LispError::Type(e)) if e.contains("if statement condition did not resolve to a bool")
+            )
+        );
+        assert!(
+            matches!(
+                eval_result(Env::basis(), "(and #t 1)"),
+                Err(LispError::Type(e)) if e.contains("and statement conditions did not resolve to bools")
+            )
+        );
+    }
+
+    #[test]
     fn eval_applications_and_quotes() {
         let (result, _) = eval(Env::basis(), "(apply + (list 13 14))");
         assert_eq!(result, LO::Fixnum(27));
 
         let (result, _) = eval(Env::basis(), "(apply + '((if #t ~12 13) 14))");
         assert_eq!(result, LO::Fixnum(2));
+
+        let (q1, _) = eval(Env::basis(), "'(if #t 1 2)");
+        let (q2, _) = eval(Env::basis(), "(quote (if #t 1 2))");
+        assert_eq!(q1, q2);
+        assert_eq!(q1.to_string(), "(if #t 1 2)");
     }
 
     #[test]
@@ -1206,6 +1232,22 @@ mod tests {
         // let* ==> y should depend on the previous x
         let (res, _env) = eval(env, "(let* ((x 4) (y (* x x))) (+ x y))");
         assert_eq!(res, LO::Fixnum(20));
+    }
+
+    #[test]
+    fn unique_binding_errors() {
+        assert!(
+            matches!(
+                eval_result(Env::basis(), "(let ((x 1) (x 2)) x)"),
+                Err(LispError::Parse(e)) if e.contains("'let' expects unique bindings")
+            )
+        );
+        assert!(
+            matches!(
+                eval_result(Env::basis(), "(val f (lambda (x x) x))"),
+                Err(LispError::Parse(e)) if e.contains("'lambda' expects unique bindings")
+            )
+        );
     }
 
     #[test]
