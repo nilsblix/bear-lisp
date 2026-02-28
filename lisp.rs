@@ -1,9 +1,27 @@
 use std::fmt;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::cell::{RefCell, RefMut};
 use std::rc::Rc;
 
-struct Stream<R: BufRead> {
+trait LineSource {
+    fn read_line(&mut self, buf: &mut String) -> io::Result<usize>;
+}
+
+impl<T: BufRead> LineSource for T {
+    fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
+        BufRead::read_line(self, buf)
+    }
+}
+
+struct StdinSource;
+
+impl LineSource for StdinSource {
+    fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
+        io::stdin().read_line(buf)
+    }
+}
+
+struct Stream<R: LineSource> {
     reader: R,
     line: String,
     i: usize,
@@ -34,6 +52,7 @@ pub enum LispError {
     Parse(String),
     Type(String),
     Env(String),
+    Primitive(String),
 }
 
 impl fmt::Display for LispError {
@@ -43,6 +62,7 @@ impl fmt::Display for LispError {
             Parse(e) => write!(f, "parse: {e}"),
             Type(e) => write!(f, "type: {e}"),
             Env(e) => write!(f, "env: {e}"),
+            Primitive(e) => write!(f, "{e}"),
         }
     }
 }
@@ -54,7 +74,7 @@ fn symbol_start(c: char) -> bool {
     }
 }
 
-impl<R: BufRead> Stream<R> {
+impl<R: LineSource> Stream<R> {
     fn new(reader: R) -> Self {
         Self { reader, line: String::new(), i: 0, line_num: 1, unread: None }
     }
@@ -123,6 +143,15 @@ impl<R: BufRead> Stream<R> {
         Ok(())
     }
 
+    fn eat_comment(&mut self) -> io::Result<()> {
+        while let Some(c) = self.read_char()? {
+            if c == '\n' {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn read_fixnum(&mut self, first: char) -> Result<LO, End> {
         assert!(first == '-' || first.is_digit(10));
         let is_negative = first == '-';
@@ -151,6 +180,11 @@ impl<R: BufRead> Stream<R> {
             Some(c) => c,
             None => return Err(End::Eof),
         };
+
+        if c == ';' {
+            self.eat_comment().map_err(|e| End::Io(e))?;
+            return self.read_lo();
+        }
 
         if c.is_ascii_digit() || c == '~' {
             return self.read_fixnum(if c == '~' { '-' } else { c });
@@ -362,6 +396,53 @@ impl Env {
             }
         });
 
+        let prim_getchar = Primitive("getchar".to_string(), |args| {
+            num_args("getchar", 0, args)?;
+            let mut handle = io::stdin().lock();
+            let mut buf = [0u8; 1];
+            match handle.read(&mut buf) {
+                Ok(0) => Ok(LO::Fixnum(-1)), // eof
+                Ok(_) => Ok(LO::Fixnum(buf[0] as i64)),
+                Err(e) => Err(LispError::Primitive(format!("io error in 'getchar': {}", e))),
+            }
+        });
+
+        let prim_print = Primitive("print".to_string(), |args| {
+            num_args("print", 1, args)?;
+            print!("{}", &args[0].to_string());
+            _ = io::stdout().flush();
+            Ok(LO::Bool(true))
+        });
+
+        let prim_itoc = Primitive("itoc".to_string(), |args| {
+            num_args("itoc", 1, args)?;
+            if let LO::Fixnum(i) = args[0] {
+                let c = match char::from_u32(*i as u32) {
+                    Some(x) => x,
+                    None => {
+                        let s = format!("could not format integer '{}' as char", i);
+                        return Err(LispError::Primitive(s));
+                    },
+                };
+                Ok(LO::Symbol(c.to_string()))
+
+            } else {
+                let s = format!("'itoc' primitive expects one integer argument, found: '{}'", args[0]);
+                Err(LispError::Type(s))
+            }
+        });
+
+        let prim_cat = Primitive("cat".to_string(), |args| {
+            num_args("cat", 2, args)?;
+            if let (LO::Symbol(a), LO::Symbol(b)) = (args[0], args[1]) {
+                Ok(LO::Symbol(format!("{}{}", a, b)))
+            } else {
+                let s = format!("'cat' primitive takes two symbol arguments, found: '{}' and '{}'",
+                    args[0], args[1]);
+                Err(LispError::Type(s))
+            }
+        });
+
         let prim_add = bin_fixnum_prim!("+", LO::Fixnum, +);
         let prim_sub = bin_fixnum_prim!("-", LO::Fixnum, -);
         let prim_mult = bin_fixnum_prim!("*", LO::Fixnum, *);
@@ -383,6 +464,10 @@ impl Env {
         let env = env.bind("cdr".to_string(), prim_cdr);
         let env = env.bind("atom?".to_string(), prim_atomp);
         let env = env.bind("sym?".to_string(), prim_symp);
+        let env = env.bind("getchar".to_string(), prim_getchar);
+        let env = env.bind("print".to_string(), prim_print);
+        let env = env.bind("itoc".to_string(), prim_itoc);
+        let env = env.bind("cat".to_string(), prim_cat);
         env
     }
 
@@ -675,7 +760,6 @@ impl fmt::Display for Lets {
 enum Definition {
     Val(String, Expr),
     Fun(String, Vec<String>, Expr),
-    Expr(Expr),
 }
 
 fn eval_bindings(
@@ -721,7 +805,6 @@ impl Expr {
                 *loc.borrow_mut() = Some(clo.clone());
                 Ok((clo, env.bind_rc(n.to_string(), loc)))
             },
-            Definition::Expr(e) => Ok((e.eval_expr(&env)?, env)),
         }
     }
 
@@ -882,13 +965,15 @@ impl fmt::Display for LO {
     }
 }
 
-fn repl<R: BufRead>(stream: &mut Stream<R>, env: Env) -> io::Result<()> {
+fn repl<R: LineSource>(stream: &mut Stream<R>, env: Env, is_stdin: bool) -> io::Result<()> {
     use End::*;
 
     let mut e = env;
     loop {
-        print!("> ");
-        _ = io::stdout().flush()?;
+        if is_stdin {
+            print!("> ");
+            _ = io::stdout().flush()?;
+        }
 
         let expr = match stream.read_lo() {
             Ok(lo) => lo,
@@ -926,8 +1011,22 @@ fn repl<R: BufRead>(stream: &mut Stream<R>, env: Env) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
-    let mut stream = Stream::new(io::stdin().lock());
-    repl(&mut stream, Env::basis())?;
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(path) = args.get(1) {
+        let p = std::path::Path::new(path);
+        let mut f = std::fs::File::open(p)?;
+
+        let mut buf = Vec::new();
+        let _ = f.read_to_end(&mut buf)?;
+
+        let s = String::from_utf8(buf).unwrap_or_else(|_| panic!("bad..."));
+        let mut stream = Stream::new(std::io::Cursor::new(s));
+        repl(&mut stream, Env::basis(), false)?;
+        return Ok(());
+    }
+
+    let mut stream = Stream::new(StdinSource);
+    repl(&mut stream, Env::basis(), true)?;
     Ok(())
 }
 
@@ -1078,6 +1177,7 @@ mod tests {
         assert_eq!(eval(Env::basis(), "(pair 12 (pair 13 14))").0.to_string(), "(12 . (13 . 14))");
         assert_eq!(eval(Env::basis(), "(eq ((lambda (x) (+ x 1)) 10) 11)").0.to_string(), "#t");
         assert_eq!(eval(Env::basis(), "(eq ((lambda (x) (+ x 1)) 10) 12)").0.to_string(), "#f");
+        assert_eq!(eval(Env::basis(), "(itoc 128175)").0.to_string().as_str(), "💯");
 
         // NOTE: should stuff like this be allowed? currently the program experiences stack overflow
         // when trying to compare functions stored in an env.
@@ -1253,9 +1353,16 @@ mod tests {
     #[test]
     fn let_rec() {
         let env = Env::basis();
-        let (res, _env) = eval(env, "(letrec ((f (lambda (x) (g (+ x 1))))
+        let (res, env) = eval(env, "(letrec ((f (lambda (x) (g (+ x 1))))
                                               (g (lambda (x) (+ x 3))))
                                        (f 0))");
         assert_eq!(res, LO::Fixnum(4));
+
+        let (res, _env) = eval(env, "(letrec ((factorial (lambda (x) (
+                                                            if (< x 2)
+                                                              1
+                                                              (* x (factorial (- x 1)))))))
+                                             (factorial 5))");
+        assert_eq!(res, LO::Fixnum(120));
     }
 }
