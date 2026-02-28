@@ -921,6 +921,13 @@ mod tests {
     use super::*;
     use io::Cursor;
 
+    fn eval(env: Env, input: &str) -> (LO, Env) {
+        let mut s = Stream::new(Cursor::new(input));
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+        ast.eval(env).unwrap()
+    }
+
     #[test]
     fn read_char() {
         let input = Cursor::new("hello  \n\t world");
@@ -1012,33 +1019,18 @@ mod tests {
     }
 
     #[test]
-    fn eval() {
-        let input = Cursor::new("(if #t (if #t 1 2) 3)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        assert_eq!(ast.eval(Env::new()).unwrap().0.to_string(), "1");
-
-        let input = Cursor::new("(if #f (if #t 1 2) (if #t (list 34 35) 12))");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        assert_eq!(ast.eval(Env::basis()).unwrap().0.to_string(), "(34 35)");
+    fn eval_forms() {
+        assert_eq!(eval(Env::new(), "(if #t (if #t 1 2) 3)").0.to_string(), "1");
+        assert_eq!(
+            eval(Env::basis(), "(if #f (if #t 1 2) (if #t (list 34 35) 12))").0.to_string(),
+            "(34 35)"
+        );
 
         let env = Env::new();
-
-        let input = Cursor::new("(val x #t)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        let (res, env) = ast.eval(env).unwrap();
+        let (res, env) = eval(env, "(val x #t)");
         assert_eq!(res.to_string(), "#t");
 
-        let input = Cursor::new("(val y (if x ~12 13))");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        let (res, env) = ast.eval(env).unwrap();
+        let (res, env) = eval(env, "(val y (if x ~12 13))");
         assert_eq!(res.to_string(), "-12");
 
         assert_eq!(env.lookup("x").unwrap(), LO::Bool(true));
@@ -1047,41 +1039,12 @@ mod tests {
 
     #[test]
     fn eval_basis() {
-        let input = Cursor::new("(+ 12 13)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        assert_eq!(ast.eval(Env::basis()).unwrap().0.to_string(), "25");
-
-        let input = Cursor::new("(pair 12 13)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        assert_eq!(ast.eval(Env::basis()).unwrap().0.to_string(), "(12 . 13)");
-
-        let input = Cursor::new("(pair (pair 12 13) 14)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        assert_eq!(ast.eval(Env::basis()).unwrap().0.to_string(), "((12 . 13) . 14)");
-
-        let input = Cursor::new("(pair 12 (pair 13 14))");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        assert_eq!(ast.eval(Env::basis()).unwrap().0.to_string(), "(12 . (13 . 14))");
-
-        let input = Cursor::new("(eq ((lambda (x) (+ x 1)) 10) 11)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        assert_eq!(ast.eval(Env::basis()).unwrap().0.to_string(), "#t");
-
-        let input = Cursor::new("(eq ((lambda (x) (+ x 1)) 10) 12)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        assert_eq!(ast.eval(Env::basis()).unwrap().0.to_string(), "#f");
+        assert_eq!(eval(Env::basis(), "(+ 12 13)").0.to_string(), "25");
+        assert_eq!(eval(Env::basis(), "(pair 12 13)").0.to_string(), "(12 . 13)");
+        assert_eq!(eval(Env::basis(), "(pair (pair 12 13) 14)").0.to_string(), "((12 . 13) . 14)");
+        assert_eq!(eval(Env::basis(), "(pair 12 (pair 13 14))").0.to_string(), "(12 . (13 . 14))");
+        assert_eq!(eval(Env::basis(), "(eq ((lambda (x) (+ x 1)) 10) 11)").0.to_string(), "#t");
+        assert_eq!(eval(Env::basis(), "(eq ((lambda (x) (+ x 1)) 10) 12)").0.to_string(), "#f");
 
         // NOTE: should stuff like this be allowed? currently the program experiences stack overflow
         // when trying to compare functions stored in an env.
@@ -1096,145 +1059,63 @@ mod tests {
 
     #[test]
     fn eval_env_form() {
-        let input = Cursor::new("(env)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
         let env = Env::basis();
-        let (result, env_prime) = ast.eval(env.clone()).unwrap();
+        let (result, env_prime) = eval(env.clone(), "(env)");
         assert_eq!(result.to_string(), env.to_string());
         assert_eq!(env_prime.to_string(), env.to_string());
     }
 
     #[test]
     fn eval_applications_and_quotes() {
-        let input = Cursor::new("(apply + (list 13 14))");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
-        let env = Env::basis();
-        let (result, _) = ast.eval(env).unwrap();
+        let (result, _) = eval(Env::basis(), "(apply + (list 13 14))");
         assert_eq!(result, LO::Fixnum(27));
 
-        let input = Cursor::new("(apply + '((if #t ~12 13) 14))");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
-        let env = Env::basis();
-        let (result, _) = ast.eval(env).unwrap();
+        let (result, _) = eval(Env::basis(), "(apply + '((if #t ~12 13) 14))");
         assert_eq!(result, LO::Fixnum(2));
     }
 
     #[test]
     fn eval_lambda() {
         let env = Env::basis();
-
-        let input = Cursor::new("(val add-one (lambda (x) (+ x 1)))");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
-        let (_, env) = ast.eval(env).unwrap();
-
-        let input = Cursor::new("(add-one 12)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
-        let (res, env) = ast.eval(env).unwrap();
+        let (_, env) = eval(env, "(val add-one (lambda (x) (+ x 1)))");
+        let (res, env) = eval(env, "(add-one 12)");
         assert_eq!(res, LO::Fixnum(13));
 
-        let input = Cursor::new("(val add-three (lambda (x) (add-one (add-one (add-one x)))))");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
-        let (_, env) = ast.eval(env).unwrap();
-
-        let input = Cursor::new("(add-three ~90)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
-        let (res, _) = ast.eval(env).unwrap();
+        let (_, env) = eval(env, "(val add-three (lambda (x) (add-one (add-one (add-one x)))))");
+        let (res, _) = eval(env, "(add-three ~90)");
         assert_eq!(res, LO::Fixnum(-87));
     }
 
     #[test]
     fn define_and_eval_function() {
         let env = Env::basis();
-
-        let input = Cursor::new("(define f (x) (if (eq x 0) 1 (* x (f (+ x ~1)))))");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
-        let (_, env) = ast.eval(env).unwrap();
-
-        let input = Cursor::new("(f 4)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
-        let (res, env) = ast.eval(env).unwrap();
+        let (_, env) = eval(env, "(define f (x) (if (eq x 0) 1 (* x (f (+ x ~1)))))");
+        let (res, env) = eval(env, "(f 4)");
         assert_eq!(res, LO::Fixnum(24));
 
-        let input = Cursor::new("(f 5)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
-        let (res, env) = ast.eval(env).unwrap();
+        let (res, env) = eval(env, "(f 5)");
         assert_eq!(res, LO::Fixnum(120));
 
-        let input = Cursor::new("(f 6)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
-        let (res, _) = ast.eval(env).unwrap();
+        let (res, _) = eval(env, "(f 6)");
         assert_eq!(res, LO::Fixnum(720));
     }
 
     #[test]
     fn eval_cond() {
         let env = Env::basis();
-
-        let cond = Cursor::new("(cond ((< x 4) 'lower)
-                                      ((= x 4) 'equal)
-                                      ((> x 4) 'higher))");
-        let mut s = Stream::new(cond);
-        let e_cond = s.read_lo().unwrap();
-        let ast_cond = e_cond.build_ast().unwrap();
-
-        let input = Cursor::new("(val x 3)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
-        let (_, env) = ast.eval(env).unwrap();
-        let (res, env) = ast_cond.eval(env).unwrap();
+        let cond = "(cond ((< x 4) 'lower)
+                          ((= x 4) 'equal)
+                          ((> x 4) 'higher))";
+        let (_, env) = eval(env, "(val x 3)");
+        let (res, env) = eval(env, cond);
         assert_eq!(res.to_string(), "lower".to_string());
 
-        let input = Cursor::new("(val x 4)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
-        let (_, env) = ast.eval(env).unwrap();
-        let (res, env) = ast_cond.eval(env).unwrap();
+        let (_, env) = eval(env, "(val x 4)");
+        let (res, env) = eval(env, cond);
         assert_eq!(res.to_string(), "equal".to_string());
 
-        let input = Cursor::new("(val x 5)");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-
-        let (_, env) = ast.eval(env).unwrap();
-        let (res, _) = ast_cond.eval(env).unwrap();
+        let (_, env) = eval(env, "(val x 5)");
+        let (res, _) = eval(env, cond);
         assert_eq!(res.to_string(), "higher".to_string());
 
     }
@@ -1242,38 +1123,17 @@ mod tests {
     #[test]
     fn let_regular() {
         let env = Env::basis();
+        let (_, env) = eval(env, "(define f (x) (cond ((< x 4) 'lower)
+                                                      ((= x 4) 'equal)
+                                                      ((> x 4) 'higher)))");
 
-
-        let def_f = Cursor::new("(define f(x) (cond ((< x 4) 'lower)
-                                      ((= x 4) 'equal)
-                                      ((> x 4) 'higher)))");
-        let mut s = Stream::new(def_f);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        let (_, env) = ast.eval(env).unwrap();
-
-        let input = Cursor::new("(let ((x 5)) (f x))");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        let (res, env) = ast.eval(env).unwrap();
-
+        let (res, env) = eval(env, "(let ((x 5)) (f x))");
         assert_eq!(res.to_string(), "higher");
 
-        let input = Cursor::new("(let ((z 4)) (f z))");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        let (res, env) = ast.eval(env).unwrap();
-
+        let (res, env) = eval(env, "(let ((z 4)) (f z))");
         assert_eq!(res.to_string(), "equal");
 
-        let input = Cursor::new("(let ((value 3)) (f value))");
-        let mut s = Stream::new(input);
-        let e = s.read_lo().unwrap();
-        let ast = e.build_ast().unwrap();
-        let (res, _env) = ast.eval(env).unwrap();
-
+        let (res, _env) = eval(env, "(let ((value 3)) (f value))");
         assert_eq!(res.to_string(), "lower");
     }
 }
