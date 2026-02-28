@@ -257,18 +257,19 @@ impl Env {
 
     fn lookup(&self, name: &str) -> Result<LO, LispError> {
         let rm = self.lookup_mut(name)?;
-        Ok(rm.to_owned())
+        match rm.as_ref() {
+            Some(lo) => Ok(lo.clone()),
+            None => Err(LispError::Env(format!(
+                "'{}' evaluated to an unspecified value in env",
+                name
+            ))),
+        }
     }
 
-    fn lookup_mut(&self, name: &str) -> Result<RefMut<'_, LO>, LispError> {
+    fn lookup_mut(&self, name: &str) -> Result<RefMut<'_, Option<LO>>, LispError> {
         for (n, cell) in self.items.iter().rev() {
             if n == name {
-                let opt_ref = cell.borrow_mut();
-                return RefMut::filter_map(opt_ref, |opt| opt.as_mut())
-                    .map_err(|_| LispError::Env(format!(
-                        "'{}' evaluated to an unspecified value in env",
-                        name
-                    )));
+                return Ok(cell.borrow_mut());
             }
         }
 
@@ -832,7 +833,7 @@ impl Expr {
                 let updated = eval_bindings(bindings, &env_prime)?;
                 for (name, value) in updated.into_iter() {
                     let mut mutted = env_prime.lookup_mut(name.as_str())?;
-                    *mutted = value;
+                    *mutted = Some(value);
                 }
                 body.eval_expr(&env_prime)
             },
