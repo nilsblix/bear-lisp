@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io::{self, BufRead, Write};
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
 use std::rc::Rc;
 
 struct Stream<R: BufRead> {
@@ -227,14 +227,21 @@ impl Env {
         Self { items: Vec::new() }
     }
 
-    fn bind(mut self, name: String, value: LO) -> Self {
-        self.items.push((name, Rc::new(RefCell::new(Some(value)))));
+    fn bind_rc(mut self, name: String, b: Rc<RefCell<Option<LO>>>) -> Self {
+        // This optimization doesn't produce weird shadowing effects in 'let' due to let creating a
+        // temporary env, therefore simply overwriting the last value.
+        if let Some(item) = self.items.last_mut() {
+            if item.0 == name {
+                item.1 = b;
+                return self;
+            }
+        }
+        self.items.push((name, b));
         self
     }
 
-    fn bind_rc(mut self, name: String, b: Rc<RefCell<Option<LO>>>) -> Self {
-        self.items.push((name, b));
-        self
+    fn bind(self, name: String, value: LO) -> Self {
+        self.bind_rc(name, Rc::new(RefCell::new(Some(value))))
     }
 
     fn make_loc() -> Rc<RefCell<Option<LO>>> {
@@ -246,38 +253,27 @@ impl Env {
             self = self.bind(n.clone(), v.clone());
         }
         self
-        // for (n, v) in names.iter().zip(values.iter()) {
-        //     self = self.bind(n.clone(), v.clone());
-        // }
-        // self
     }
 
     fn lookup(&self, name: &str) -> Result<LO, LispError> {
-        if self.items.is_empty() {
-            let s = "could not find '".to_string() + name + "' in env due to empty env";
-            return Err(LispError::Env(s));
-        }
+        let rm = self.lookup_mut(name)?;
+        Ok(rm.to_owned())
+    }
 
-        for (n, v) in self.items.iter().rev() {
-            if name == n {
-                match v.borrow().as_ref() {
-                    Some(v_prime) => return Ok(v_prime.clone()),
-                    None => {
-                        let s = "'".to_string() + name
-                            + "' evaluated to an unspecified value in env";
-                        return Err(LispError::Env(s));
-                    },
-                }
+    fn lookup_mut(&self, name: &str) -> Result<RefMut<'_, LO>, LispError> {
+        for (n, cell) in self.items.iter().rev() {
+            if n == name {
+                let opt_ref = cell.borrow_mut();
+                return RefMut::filter_map(opt_ref, |opt| opt.as_mut())
+                    .map_err(|_| LispError::Env(format!(
+                        "'{}' evaluated to an unspecified value in env",
+                        name
+                    )));
             }
         }
 
         let s = "could not find '".to_string() + name + "' in env";
         return Err(LispError::Env(s));
-    }
-
-    fn extend(mut self, other: &mut Env) -> Env {
-        self.items.append(&mut other.items);
-        self
     }
 
     fn basis() -> Env {
@@ -577,7 +573,20 @@ impl LO {
                             .map(|b| make_binding(*b))
                             .collect::<Result<Vec<(String, Expr)>, LispError>>()?;
 
-                        assert_unique(&l, &bindings.iter().map(|x| x.0.as_str()).collect::<Vec<&str>>().as_slice())?;
+                        // let* enables imperative-style lets such as
+                        // (let* ((x 5)
+                        //     (x (factorial x))
+                        //     (x (sqrt x))
+                        //     (x (to-string x)))
+                        //   (print x))
+                        if l != Lets::Star {
+                            let names: Vec<&str> = bindings
+                                .iter()
+                                .map(|x| x.0.as_str())
+                                .collect();
+                            assert_unique(&l, names.as_slice())?;
+                        }
+
                         let bindings = bindings
                             .iter()
                             .map(|x| (x.to_owned().0, Box::new(x.to_owned().1)))
@@ -773,7 +782,7 @@ impl Expr {
                     let ast = arg.build_ast()?;
                     primed.push(ast.eval_expr(env)?);
                 }
-                Expr::eval_apply(env.clone(), f, primed)
+                Expr::eval_apply(f, primed)
             },
             Call(b) => {
                 if let (Expr::Var(name), true) = (&(*b).0, (*b).1.is_empty()) {
@@ -799,29 +808,59 @@ impl Expr {
                     primed.push(arg.eval_expr(env)?);
                 }
 
-                Expr::eval_apply(env.clone(), f, primed)
+                Expr::eval_apply(f, primed)
             },
             Lambda(ns, e) => Ok(LO::Closure(ns.clone(), e.clone(), env.clone())),
             Let(Lets::Fixed, bindings, body) => {
                 let mapped = eval_bindings(bindings, env)?;
                 body.eval_expr(&env.clone().bind_list(mapped))
             },
-            Let(Lets::Star, _bindings, _body) => panic!("unimplemented"),
-            Let(Lets::Rec, _bindings, _body) => panic!("unimplemented"),
+            Let(Lets::Star, bindings, body) => {
+                let mut bound_env = env.clone();
+                for (name, b) in bindings.iter() {
+                    let lo = b.eval_expr(&bound_env)?;
+                    bound_env = bound_env.bind(name.clone(), lo);
+                }
+                body.eval_expr(&bound_env)
+            },
+            Let(Lets::Rec, bindings, body) => {
+                let mut env_prime = env.clone();
+                for (name, _) in bindings.iter() {
+                    let empty = Env::make_loc();
+                    env_prime = env_prime.bind_rc(name.clone(), empty);
+                }
+                let updated = eval_bindings(bindings, &env_prime)?;
+                for (name, value) in updated.into_iter() {
+                    let mut mutted = env_prime.lookup_mut(name.as_str())?;
+                    *mutted = value;
+                }
+                body.eval_expr(&env_prime)
+            },
         }
     }
 
-    fn eval_apply(env: Env, f: LO, values: Vec<LO>) -> Result<LO, LispError> {
+    fn eval_apply(f: LO, values: Vec<LO>) -> Result<LO, LispError> {
         match f {
             LO::Primitive(_, f) => f(values.iter().collect::<Vec<&LO>>().as_slice()),
             LO::Closure(ns, e, cl_env) => {
-                let params: Vec<(String, LO)> = ns
+                let zipped: Vec<(String, LO)> = ns
                     .into_iter()
-                    .zip(values.into_iter())
+                    .zip(values)
                     .collect();
-                let combined = env.extend(&mut cl_env.bind_list(params));
-                e.eval_expr(&combined)
+                e.eval_expr(&cl_env.bind_list(zipped))
             },
+            // FIXME: What does he mean by
+            // "It’s what we should have used in the last post, instead of adding that ugly hack to
+            // evalapply"?
+            //
+            // LO::Closure(ns, e, cl_env) => {
+            //     let params: Vec<(String, LO)> = ns
+            //         .into_iter()
+            //         .zip(values.into_iter())
+            //         .collect();
+            //     let combined = env.extend(&mut cl_env.bind_list(params));
+            //     e.eval_expr(&combined)
+            // },
             _ => {
                 let s = "tried to call a non-function, found: '".to_string()
                     + &f.to_string() + "'";
@@ -1133,7 +1172,47 @@ mod tests {
         let (res, env) = eval(env, "(let ((z 4)) (f z))");
         assert_eq!(res.to_string(), "equal");
 
-        let (res, _env) = eval(env, "(let ((value 3)) (f value))");
+        let (res, env) = eval(env, "(let ((value 3)) (f value))");
         assert_eq!(res.to_string(), "lower");
+
+        let (_, env) = eval(env, "(val x 34)");
+        let (res, _env) = eval(env, "(let ((a (+ x 32))) (+ a 1))");
+        assert_eq!(res, LO::Fixnum(67));
+    }
+
+    #[test]
+    fn let_star() {
+        let env = Env::basis();
+        let (res, env) = eval(env, "(let* ((x 34) (y x)) y)");
+        assert_eq!(res, LO::Fixnum(34));
+
+        let (res, _env) = eval(env, "(let* ((x 34) (y (+ x 33))) y))");
+        assert_eq!(res, LO::Fixnum(67));
+    }
+
+    #[test]
+    fn let_shadow() {
+        let env = Env::basis();
+        let (_, env) = eval(env, "(val x 5)");
+        let (res, env) = eval(env, "(let* ((x 4) (x (* x 4))) x)");
+        assert_eq!(res, LO::Fixnum(16));
+
+        let (_, env) = eval(env, "(val y 20)");
+        // let ==> y should depend on (val x 5)
+        let (res, env) = eval(env, "(let ((x 4) (y (* x x))) (+ x y))");
+        assert_eq!(res, LO::Fixnum(29));
+
+        // let* ==> y should depend on the previous x
+        let (res, _env) = eval(env, "(let* ((x 4) (y (* x x))) (+ x y))");
+        assert_eq!(res, LO::Fixnum(20));
+    }
+
+    #[test]
+    fn let_rec() {
+        let env = Env::basis();
+        let (res, _env) = eval(env, "(letrec ((f (lambda (x) (g (+ x 1))))
+                                              (g (lambda (x) (+ x 3))))
+                                       (f 0))");
+        assert_eq!(res, LO::Fixnum(4));
     }
 }
