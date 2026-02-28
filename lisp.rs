@@ -299,10 +299,6 @@ impl Env {
             };
         }
 
-        let prim_add = bin_fixnum_prim!("+", LO::Fixnum, +);
-        let prim_sub = bin_fixnum_prim!("-", LO::Fixnum, -);
-        let prim_mult = bin_fixnum_prim!("*", LO::Fixnum, *);
-
         let prim_eq = Primitive("eq".to_string(), |args| {
             num_args("eq", 2, args)?;
             Ok(LO::Bool(args[0] == args[1]))
@@ -355,11 +351,21 @@ impl Env {
             }
         });
 
+        let prim_add = bin_fixnum_prim!("+", LO::Fixnum, +);
+        let prim_sub = bin_fixnum_prim!("-", LO::Fixnum, -);
+        let prim_mult = bin_fixnum_prim!("*", LO::Fixnum, *);
+        let prim_le = bin_fixnum_prim!("<", LO::Bool, <);
+        let prim_gt = bin_fixnum_prim!(">", LO::Bool, >);
+        let prim_int_eq = bin_fixnum_prim!("=", LO::Bool, ==);
+
         let env = Env::new();
         let env = env.bind("+".to_string(), prim_add);
         let env = env.bind("eq".to_string(), prim_eq);
         let env = env.bind("-".to_string(), prim_sub);
         let env = env.bind("*".to_string(), prim_mult);
+        let env = env.bind("<".to_string(), prim_le);
+        let env = env.bind(">".to_string(), prim_gt);
+        let env = env.bind("=".to_string(), prim_int_eq);
         let env = env.bind("pair".to_string(), prim_pair);
         let env = env.bind("list".to_string(), prim_list);
         let env = env.bind("car".to_string(), prim_car);
@@ -445,6 +451,38 @@ impl LO {
                         Ok(Expr::Def(Box::new(Definition::Val(n.clone(), e.build_ast()?)))),
                     [sym, e] if matches!(sym, Symbol(s) if s == "quote") =>
                         Ok(Expr::Literal((*e).clone())),
+                    [sym, conditions @ ..] if matches!(sym, Symbol(s) if s == "cond") => {
+                        fn cond_to_if(xs: &[&LO]) -> Result<Expr, LispError> {
+                            if xs.is_empty() {
+                                let s = "'cond' takes a list of conditions, found nothing".to_string();
+                                return Err(LispError::Parse(s));
+                            }
+
+                            if let LO::Pair(b) = xs[0] {
+                                let (cond, cell) = b.as_ref();
+                                if let LO::Pair(b) = cell {
+                                    if b.1 == LO::Nil {
+                                        let rest = b.0.clone();
+                                        let cond_ast = cond.build_ast()?;
+                                        let rest_ast = rest.build_ast()?;
+                                        let conds = if xs.len() == 1 {
+                                            Expr::Literal(LO::Symbol("error".to_string()))
+                                        } else {
+                                            cond_to_if(&xs[1..])?
+                                        };
+                                        let b = Box::new((cond_ast, rest_ast, conds));
+                                        return Ok(Expr::If(b));
+                                    }
+                                }
+                            }
+
+                            let s = "'cond' takes a list of conditions, found '".to_string()
+                                + &xs[0].to_string() + "'";
+                            Err(LispError::Parse(s))
+                        }
+
+                        cond_to_if(conditions)
+                    },
                     [sym, ns, e] if ns.is_list() && matches!(sym, Symbol(s) if s == "lambda") => {
                         let formals: Result<Vec<String>, LispError> = ns
                             .pair_to_list()
@@ -702,7 +740,6 @@ impl fmt::Display for LO {
             },
             Primitive(name, _) => write!(f, "#<primitive:{name}>"),
             Quote(q) => write!(f, "'{}", *q),
-            // TODO: clean this up
             Closure(_, _, _) => write!(f, "#<closure>"),
         }
     }
@@ -1039,5 +1076,45 @@ mod tests {
 
         let (res, _) = ast.eval(env).unwrap();
         assert_eq!(res, LO::Fixnum(720));
+    }
+
+    #[test]
+    fn eval_cond() {
+        let env = Env::basis();
+
+        let cond = Cursor::new("(cond ((< x 4) 'lower)
+                                      ((= x 4) 'equal)
+                                      ((> x 4) 'higher))");
+        let mut s = Stream::new(cond);
+        let e_cond = s.read_lo().unwrap();
+        let ast_cond = e_cond.build_ast().unwrap();
+
+        let input = Cursor::new("(val x 3)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+
+        let (_, env) = ast.eval(env).unwrap();
+        let (res, env) = ast_cond.eval(env).unwrap();
+        assert_eq!(res.to_string(), "lower".to_string());
+
+        let input = Cursor::new("(val x 4)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+
+        let (_, env) = ast.eval(env).unwrap();
+        let (res, env) = ast_cond.eval(env).unwrap();
+        assert_eq!(res.to_string(), "equal".to_string());
+
+        let input = Cursor::new("(val x 5)");
+        let mut s = Stream::new(input);
+        let e = s.read_lo().unwrap();
+        let ast = e.build_ast().unwrap();
+
+        let (_, env) = ast.eval(env).unwrap();
+        let (res, _) = ast_cond.eval(env).unwrap();
+        assert_eq!(res.to_string(), "higher".to_string());
+
     }
 }
