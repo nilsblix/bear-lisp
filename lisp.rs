@@ -271,6 +271,11 @@ impl Env {
         return Err(LispError::Env(s));
     }
 
+    fn extend(mut self, other: &mut Env) -> Env {
+        self.items.append(&mut other.items);
+        self
+    }
+
     fn basis() -> Env {
         use LO::Primitive;
         fn num_args(name: &str, n: usize, args: &[&LO]) -> Result<(), LispError> {
@@ -657,17 +662,7 @@ impl Expr {
                     let ast = arg.build_ast()?;
                     primed.push(ast.eval_expr(env)?);
                 }
-                let primed_ref: Vec<&LO> = primed.iter().collect();
-
-                match f {
-                    LO::Primitive(_, f) => f(primed_ref.as_slice()),
-                    LO::Closure(ns, e, cl_env) => e.eval_expr(&cl_env.bind_list(ns, primed)),
-                    _ => {
-                        let s = "cannot apply to a non-primitive/closure: '".to_string()
-                            + &f.to_string() + "'";
-                        Err(LispError::Type(s))
-                    },
-                }
+                Expr::eval_apply(env.clone(), f, primed)
             },
             Call(b) => {
                 if let (Expr::Var(name), true) = (&(*b).0, (*b).1.is_empty()) {
@@ -692,19 +687,25 @@ impl Expr {
                 for arg in args.iter() {
                     primed.push(arg.eval_expr(env)?);
                 }
-                let primed_ref: Vec<&LO> = primed.iter().collect();
 
-                match f {
-                    LO::Primitive(_, f) => f(primed_ref.as_slice()),
-                    LO::Closure(ns, e, cl_env) => e.eval_expr(&cl_env.bind_list(ns, primed)),
-                    _ => {
-                        let s = "cannot call a non-primitive/closure: '".to_string()
-                            + &f.to_string() + "'";
-                        Err(LispError::Type(s))
-                    },
-                }
+                Expr::eval_apply(env.clone(), f, primed)
             },
             Lambda(ns, e) => Ok(LO::Closure(ns.clone(), e.clone(), env.clone())),
+        }
+    }
+
+    fn eval_apply(env: Env, f: LO, values: Vec<LO>) -> Result<LO, LispError> {
+        match f {
+            LO::Primitive(_, f) => f(values.iter().collect::<Vec<&LO>>().as_slice()),
+            LO::Closure(ns, e, cl_env) => {
+                let combined = env.extend(&mut cl_env.bind_list(ns, values));
+                e.eval_expr(&combined)
+            },
+            _ => {
+                let s = "tried to call a non-function, found: '".to_string()
+                    + &f.to_string() + "'";
+                Err(LispError::Type(s))
+            },
         }
     }
 }
@@ -747,7 +748,6 @@ impl fmt::Display for LO {
 
 fn repl<R: BufRead>(stream: &mut Stream<R>, env: Env) -> io::Result<()> {
     use End::*;
-    use LispError::*;
 
     let mut e = env;
     loop {
