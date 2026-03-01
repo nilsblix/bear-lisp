@@ -411,7 +411,7 @@ impl Env {
             num_args("print", 1, args)?;
             print!("{}", &args[0].to_string());
             _ = io::stdout().flush();
-            Ok(LO::Bool(true))
+            Ok(LO::Symbol("ok".to_string()))
         });
 
         let prim_itoc = Primitive("itoc".to_string(), |args| {
@@ -437,7 +437,18 @@ impl Env {
             if let (LO::Symbol(a), LO::Symbol(b)) = (args[0], args[1]) {
                 Ok(LO::Symbol(format!("{}{}", a, b)))
             } else {
-                let s = format!("'cat' primitive takes two symbol arguments, found: '{}' and '{}'",
+                let s = format!("'cat' primitive expects two symbol arguments, found: '{}' and '{}'",
+                    args[0], args[1]);
+                Err(LispError::Type(s))
+            }
+        });
+
+        let prim_div = Primitive("/".to_string(), |args| {
+            num_args("/", 2, args)?;
+            if let (LO::Fixnum(a), LO::Fixnum(b)) = (args[0], args[1]) {
+                Ok(LO::Fixnum(a / b))
+            } else {
+                let s = format!("'cat' primitive expects two integer arguments, found: '{}' and '{}'",
                     args[0], args[1]);
                 Err(LispError::Type(s))
             }
@@ -455,6 +466,7 @@ impl Env {
         let env = env.bind("eq".to_string(), prim_eq);
         let env = env.bind("-".to_string(), prim_sub);
         let env = env.bind("*".to_string(), prim_mult);
+        let env = env.bind("/".to_string(), prim_div);
         let env = env.bind("<".to_string(), prim_le);
         let env = env.bind(">".to_string(), prim_gt);
         let env = env.bind("=".to_string(), prim_int_eq);
