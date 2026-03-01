@@ -1,44 +1,19 @@
 use std::fmt;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::cell::{RefCell, RefMut};
 use std::rc::Rc;
-
-trait LineSource {
-    fn read_line(&mut self, buf: &mut String) -> io::Result<usize>;
-}
-
-impl<T: BufRead> LineSource for T {
-    fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
-        BufRead::read_line(self, buf)
-    }
-}
-
-struct StdinSource;
-
-impl LineSource for StdinSource {
-    fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
-        io::stdin().read_line(buf)
-    }
-}
-
-struct Stream<R: LineSource> {
-    reader: R,
-    line: String,
-    i: usize,
-    line_num: usize,
-    unread: Option<char>,
-}
+use std::collections::VecDeque;
 
 #[derive(Debug)]
-pub enum End {
+enum Parsed {
     Eof,
-    Io(std::io::Error),
+    Io(io::Error),
     Lisp(LispError),
 }
 
-impl fmt::Display for End {
+impl fmt::Display for Parsed {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use End::*;
+        use Parsed::*;
         match self {
             Eof => write!(f, "eof"),
             Io(e) => write!(f, "{e}"),
@@ -52,7 +27,7 @@ pub enum LispError {
     Parse(String),
     Type(String),
     Env(String),
-    Primitive(String),
+    Prim(String),
 }
 
 impl fmt::Display for LispError {
@@ -62,7 +37,7 @@ impl fmt::Display for LispError {
             Parse(e) => write!(f, "parse: {e}"),
             Type(e) => write!(f, "type: {e}"),
             Env(e) => write!(f, "env: {e}"),
-            Primitive(e) => write!(f, "{e}"),
+            Prim(e) => write!(f, "{e}"),
         }
     }
 }
@@ -74,49 +49,84 @@ fn symbol_start(c: char) -> bool {
     }
 }
 
-impl<R: LineSource> Stream<R> {
-    fn new(reader: R) -> Self {
-        Self { reader, line: String::new(), i: 0, line_num: 1, unread: None }
+struct Stream<S>
+where S: Iterator<Item = io::Result<char>>
+{
+    s: std::iter::Peekable<S>,
+    line_num: usize,
+    unread: Vec<char>,
+    stdin: bool,
+}
+
+struct StdinIter {
+    buf: VecDeque<char>,
+    eof: bool,
+}
+
+impl StdinIter {
+    fn new() -> Self {
+        Self {
+            buf: VecDeque::new(),
+            eof: false,
+        }
     }
+}
 
-    /// Ensure we have at least one more byte available in `self.line` at `self.i`.
-    /// Returns false on EOF.
-    fn fill_if_needed(&mut self) -> io::Result<bool> {
-        if self.i < self.line.len() {
-            return Ok(true);
+impl Iterator for StdinIter {
+    type Item = io::Result<char>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(c) = self.buf.pop_front() {
+                return Some(Ok(c));
+            }
+
+            if self.eof {
+                return None;
+            }
+
+            let mut line = String::new();
+            match io::stdin().read_line(&mut line) {
+                Ok(0) => {
+                    self.eof = true;
+                    return None;
+                },
+                Ok(_) => {
+                    self.buf.extend(line.chars());
+                },
+                Err(e) => return Some(Err(e)),
+            }
         }
+    }
+}
 
-        self.line.clear();
-        self.i = 0;
-
-        let n = self.reader.read_line(&mut self.line)?;
-        if n == 0 {
-            return Ok(false); // EOF
-        }
-
-        Ok(true)
+impl<S> Stream<S>
+where S: Iterator<Item = io::Result<char>>
+{
+    fn new(s: S, stdin: bool) -> Self {
+        Self { s: s.peekable(), line_num: 1, unread: Vec::new(), stdin }
     }
 
     fn peek_char(&mut self) -> io::Result<Option<char>> {
-        if let Some(c) = self.unread {
-            return Ok(Some(c));
+        if let Some(c) = self.unread.last() {
+            Ok(Some(*c))
+        } else {
+            match self.s.peek() {
+                Some(Ok(c)) => Ok(Some(*c)),
+                Some(Err(e)) => Err(io::Error::new(e.kind(), e.to_string())),
+                None => Ok(None),
+            }
         }
-        if !self.fill_if_needed()? {
-            return Ok(None);
-        }
-        Ok(self.line[self.i..].chars().next())
     }
 
     fn read_char(&mut self) -> io::Result<Option<char>> {
-        let c = if let Some(c) = self.unread.take() {
+        let c = if let Some(c) = self.unread.pop() {
             c
         } else {
-            let c = match self.peek_char()? {
-                Some(c) => c,
+            match self.s.next() {
+                Some(c) => c?,
                 None => return Ok(None),
-            };
-            self.i += c.len_utf8();
-            c
+            }
         };
         if c == '\n' {
             self.line_num += 1;
@@ -125,11 +135,10 @@ impl<R: LineSource> Stream<R> {
     }
 
     fn unread_char(&mut self, c: char) {
-        assert!(self.unread.is_none(), "Stream only supports one unread char");
         if c == '\n' {
-            self.line_num = self.line_num.saturating_sub(1);
+            self.line_num -= 1;
         }
-        self.unread = Some(c);
+        self.unread.push(c);
     }
 
     fn eat_whitespace(&mut self) -> io::Result<()> {
@@ -152,14 +161,14 @@ impl<R: LineSource> Stream<R> {
         Ok(())
     }
 
-    fn read_fixnum(&mut self, first: char) -> Result<Value, End> {
+    fn read_fixnum(&mut self, first: char) -> Result<Value, Parsed> {
         assert!(first == '-' || first.is_digit(10));
         let is_negative = first == '-';
 
         let mut acc: i64 = if is_negative { 0 } else { (first as u8 - b'0') as i64 };
-        while let Some(c) = self.peek_char().map_err(|e| End::Io(e))? {
+        while let Some(c) = self.peek_char().map_err(|e| Parsed::Io(e))? {
             if let Some(d) = c.to_digit(10) {
-                _ = self.read_char().map_err(|e| End::Io(e))?;
+                _ = self.read_char().map_err(|e| Parsed::Io(e))?;
                 acc = acc * 10 + d as i64;
             } else {
                 break;
@@ -173,16 +182,17 @@ impl<R: LineSource> Stream<R> {
         Ok(Value::Fixnum(acc))
     }
 
-    fn read_value(&mut self) -> Result<Value, End> {
-        self.eat_whitespace().map_err(|e| End::Io(e))?;
+    /// None means eof
+    fn read_value(&mut self) -> Result<Value, Parsed> {
+        self.eat_whitespace().map_err(|e| Parsed::Io(e))?;
 
-        let c = match self.read_char().map_err(|e| End::Io(e))? {
+        let c = match self.read_char().map_err(|e| Parsed::Io(e))? {
             Some(c) => c,
-            None => return Err(End::Eof),
+            None => return Err(Parsed::Eof),
         };
 
         if c == ';' {
-            self.eat_comment().map_err(|e| End::Io(e))?;
+            self.eat_comment().map_err(|e| Parsed::Io(e))?;
             return self.read_value();
         }
 
@@ -193,7 +203,7 @@ impl<R: LineSource> Stream<R> {
         if symbol_start(c) {
             let mut acc = c.to_string();
             loop {
-                if let Some(nc) = self.read_char().map_err(|e| End::Io(e))? {
+                if let Some(nc) = self.read_char().map_err(|e| Parsed::Io(e))? {
                     let is_delim = match nc {
                         '"'|'('|')'|'{'|'}'|';' => true,
                         nc => nc.is_whitespace(),
@@ -213,7 +223,7 @@ impl<R: LineSource> Stream<R> {
         }
 
         if c == '#' {
-            match self.read_char().map_err(|e| End::Io(e))? {
+            match self.read_char().map_err(|e| Parsed::Io(e))? {
                 Some('t') => return Ok(Value::Bool(true)),
                 Some('f') => return Ok(Value::Bool(false)),
                 Some(_) | None => { },
@@ -223,16 +233,16 @@ impl<R: LineSource> Stream<R> {
         if c == '(' {
             let mut acc = Value::Nil;
             loop {
-                self.eat_whitespace().map_err(|e| End::Io(e))?;
-                let nc = self.read_char().map_err(|e| End::Io(e))?;
+                self.eat_whitespace().map_err(|e| Parsed::Io(e))?;
+                let nc = self.read_char().map_err(|e| Parsed::Io(e))?;
                 if nc.is_none() {
-                    return Err(End::Lisp(LispError::Parse("unexpected eof in list".to_string())));
+                    return Err(Parsed::Lisp(LispError::Parse("unexpected eof in list".to_string())));
                 }
 
                 let nc = nc.unwrap();
 
                 if nc == ')' {
-                    return reverse_list(acc).map_err(|e| End::Lisp(LispError::Parse(e)));
+                    return reverse_list(acc) .map_err(|e| Parsed::Lisp(LispError::Parse(e)));
                 }
 
                 self.unread_char(nc);
@@ -246,7 +256,24 @@ impl<R: LineSource> Stream<R> {
         }
 
         let s = format!("unexpected char: {}", c);
-        Err(End::Lisp(LispError::Parse(s)))
+        Err(Parsed::Lisp(LispError::Parse(s)))
+    }
+}
+
+impl Stream<std::vec::IntoIter<io::Result<char>>> {
+    fn from_str(s: &str) -> Self {
+        let iter = s
+            .chars()
+            .map(|c| Ok::<char, io::Error>(c))
+            .collect::<Vec<io::Result<char>>>()
+            .into_iter();
+        Self::new(iter, false)
+    }
+}
+
+impl Stream<StdinIter> {
+    fn from_stdin() -> Self {
+        Self::new(StdinIter::new(), true)
     }
 }
 
@@ -403,7 +430,7 @@ impl Env {
             match handle.read(&mut buf) {
                 Ok(0) => Ok(Value::Fixnum(-1)), // eof
                 Ok(_) => Ok(Value::Fixnum(buf[0] as i64)),
-                Err(e) => Err(LispError::Primitive(format!("io error in 'getchar': {}", e))),
+                Err(e) => Err(LispError::Prim(format!("io error in 'getchar': {}", e))),
             }
         });
 
@@ -421,7 +448,7 @@ impl Env {
                     Some(x) => x,
                     None => {
                         let s = format!("could not format integer '{}' as char", i);
-                        return Err(LispError::Primitive(s));
+                        return Err(LispError::Prim(s));
                     },
                 };
                 Ok(Value::Symbol(c.to_string()))
@@ -977,12 +1004,15 @@ impl fmt::Display for Value {
     }
 }
 
-fn repl<R: LineSource>(stream: &mut Stream<R>, env: Env, is_stdin: bool) -> io::Result<()> {
-    use End::*;
+fn repl<S: Iterator<Item = Result<char, io::Error>>>(
+    stream: &mut Stream<S>,
+    env: Env,
+) -> io::Result<()> {
+    use Parsed::*;
 
     let mut e = env;
     loop {
-        if is_stdin {
+        if stream.stdin {
             print!("> ");
             _ = io::stdout().flush()?;
         }
@@ -1032,23 +1062,22 @@ fn main() -> io::Result<()> {
         let _ = f.read_to_end(&mut buf)?;
 
         let s = String::from_utf8(buf).unwrap_or_else(|_| panic!("bad..."));
-        let mut stream = Stream::new(std::io::Cursor::new(s));
-        repl(&mut stream, Env::basis(), false)?;
+        let mut stream = Stream::from_str(s.as_str());
+        repl(&mut stream, Env::basis())?;
         return Ok(());
     }
 
-    let mut stream = Stream::new(StdinSource);
-    repl(&mut stream, Env::basis(), true)?;
+    let mut stream = Stream::from_stdin();
+    repl(&mut stream, Env::basis())?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use io::Cursor;
 
-    fn parse(input: &str) -> Result<Value, End> {
-        let mut s = Stream::new(Cursor::new(input));
+    fn parse(input: &str) -> Result<Value, Parsed> {
+        let mut s = Stream::from_str(input);
         s.read_value()
     }
 
@@ -1064,8 +1093,7 @@ mod tests {
 
     #[test]
     fn read_char() {
-        let input = Cursor::new("hello  \n\t world");
-        let mut s = Stream::new(input);
+        let mut s = Stream::from_str("hello  \n\t world");
 
         assert_eq!(s.read_char().unwrap().unwrap(), 'h');
         assert_eq!(s.read_char().unwrap().unwrap(), 'e');
@@ -1093,8 +1121,7 @@ mod tests {
 
     #[test]
     fn test_pair_to_list() {
-        let input = Cursor::new("(1 2 3 4 5 350)");
-        let mut s = Stream::new(input);
+        let mut s = Stream::from_str("(1 2 3 4 5 350)");
 
         let value = s.read_value().unwrap();
         let vec = value.pair_to_list();
@@ -1108,8 +1135,7 @@ mod tests {
 
     #[test]
     fn unread_char() {
-        let input = Cursor::new("ab\nc");
-        let mut s = Stream::new(input);
+        let mut s = Stream::from_str("ab\nc");
 
         assert_eq!(s.read_char().unwrap().unwrap(), 'a');
         s.unread_char('a');
@@ -1132,8 +1158,7 @@ mod tests {
 
     #[test]
     fn parse_simples() {
-        let input = Cursor::new("   12   \n15 340 #t #f ~90 hello_world bear-lisp");
-        let mut s = Stream::new(input);
+        let mut s = Stream::from_str("   12   \n15 340 #t #f ~90 hello_world bear-lisp");
 
         assert_eq!(s.read_value().unwrap(), Value::Fixnum(12));
         assert_eq!(s.line_num, 1);
@@ -1146,8 +1171,7 @@ mod tests {
         assert_eq!(s.read_value().unwrap(), Value::Symbol("hello_world".to_string()));
         assert_eq!(s.read_value().unwrap(), Value::Symbol("bear-lisp".to_string()));
 
-        let input = Cursor::new("(1 2 hello world) (34 (35 some))");
-        let mut s = Stream::new(input);
+        let mut s = Stream::from_str("(1 2 hello world) (34 (35 some))");
         assert_eq!(s.read_value().unwrap().to_string(), "(1 2 hello world)");
         assert_eq!(s.read_value().unwrap().to_string(), "(34 (35 some))");
     }
@@ -1155,10 +1179,10 @@ mod tests {
     #[test]
     fn parse_errors() {
         assert!(
-            matches!(parse("("), Err(End::Lisp(LispError::Parse(e))) if e.contains("unexpected eof in list"))
+            matches!(parse("("), Err(Parsed::Lisp(LispError::Parse(e))) if e.contains("unexpected eof in list"))
         );
         assert!(
-            matches!(parse(")"), Err(End::Lisp(LispError::Parse(e))) if e.contains("unexpected char"))
+            matches!(parse(")"), Err(Parsed::Lisp(LispError::Parse(e))) if e.contains("unexpected char"))
         );
     }
 
