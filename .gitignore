@@ -3,3 +3,4 @@
 
 # test lisp files
 *.lsp
+!stdlib.lsp

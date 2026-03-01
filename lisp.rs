@@ -223,6 +223,23 @@ struct Env {
     items: Vec<(String, Rc<RefCell<Option<Value>>>)>,
 }
 
+#[derive(Debug)]
+enum StdlibError {
+    Io(io::Error),
+    Lisp(LispError),
+}
+
+impl fmt::Display for StdlibError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use StdlibError::*;
+        write!(f, "stdlib: ")?;
+        match self {
+            Io(e) => write!(f, "{e}"),
+            Lisp(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 impl Env {
     fn new() -> Self {
         Self { items: Vec::new() }
@@ -461,6 +478,30 @@ impl Env {
                 })))
             ).collect();
         Value::list_to_pair(los)
+    }
+
+    fn with_stdlib() -> Result<Env, StdlibError> {
+        let path = std::path::Path::new("stdlib.lsp");
+        let mut buf = String::new();
+
+        let mut file = std::fs::File::open(path).map_err(|e| StdlibError::Io(e))?;
+        let _ = file.read_to_string(&mut buf).map_err(|e| StdlibError::Io(e))?;
+
+        let mut s = Stream::from_str(buf.as_str());
+
+        let mut env = Env::basis();
+        loop {
+            let v = match s.read_value() {
+                Ok(v) => v,
+                Err(ParseError::Eof) => break,
+                Err(ParseError::Lisp(e)) => return Err(StdlibError::Lisp(e)),
+            };
+            let ast = v.build_ast().map_err(|e| StdlibError::Lisp(e))?;
+
+            env = ast.eval(env).map_err(|e| StdlibError::Lisp(e))?.1;
+        }
+
+        Ok(env)
     }
 }
 
@@ -988,6 +1029,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use rustyline::error::ReadlineError;
     use rustyline::DefaultEditor;
 
+    let mut env = match Env::with_stdlib() {
+        Ok(env) => env,
+        Err(e) => {
+            println!("{e}");
+            return Ok(());
+        },
+    };
+
     let args: Vec<String> = std::env::args().collect();
     if let Some(path) = args.get(1) {
         let p = std::path::Path::new(path);
@@ -998,12 +1047,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let s = String::from_utf8(buf).unwrap_or_else(|_| panic!("bad..."));
         let mut stream = Stream::from_str(s.as_str());
-        _ = repl(&mut stream, Env::basis())?;
+        _ = repl(&mut stream, env)?;
         return Ok(());
     }
 
     let mut rl = DefaultEditor::new()?;
-    let mut env = Env::basis();
     loop {
         let readline = rl.readline("$> ");
         match readline {
@@ -1353,5 +1401,11 @@ mod tests {
         let (_, env) = eval(env, "(define factorial (x) (if (< x 2) 1 (* x (factorial (- x 1)))))");
         let (res, _env) = eval(env, "((o factorial f) 4)");
         assert_eq!(res, Value::Fixnum(120));
+    }
+
+    #[test]
+    fn okay_stdlib() {
+        // will panic on faulty std.
+        let _ = Env::with_stdlib().unwrap();
     }
 }
