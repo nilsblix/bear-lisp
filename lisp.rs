@@ -2,21 +2,18 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::cell::{RefCell, RefMut};
 use std::rc::Rc;
-use std::collections::VecDeque;
 
 #[derive(Debug)]
-enum Parsed {
+enum ParseError {
     Eof,
-    Io(io::Error),
     Lisp(LispError),
 }
 
-impl fmt::Display for Parsed {
+impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use Parsed::*;
+        use ParseError::*;
         match self {
             Eof => write!(f, "eof"),
-            Io(e) => write!(f, "{e}"),
             Lisp(e) => write!(f, "{e}"),
         }
     }
@@ -50,88 +47,41 @@ fn symbol_start(c: char) -> bool {
 }
 
 struct Stream<S>
-where S: Iterator<Item = io::Result<char>>
+where S: Iterator<Item = char>
 {
     s: std::iter::Peekable<S>,
     line_num: usize,
     unread: Vec<char>,
-    stdin: bool,
-}
-
-struct StdinIter {
-    buf: VecDeque<char>,
-    eof: bool,
-}
-
-impl StdinIter {
-    fn new() -> Self {
-        Self {
-            buf: VecDeque::new(),
-            eof: false,
-        }
-    }
-}
-
-impl Iterator for StdinIter {
-    type Item = io::Result<char>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(c) = self.buf.pop_front() {
-                return Some(Ok(c));
-            }
-
-            if self.eof {
-                return None;
-            }
-
-            let mut line = String::new();
-            match io::stdin().read_line(&mut line) {
-                Ok(0) => {
-                    self.eof = true;
-                    return None;
-                },
-                Ok(_) => {
-                    self.buf.extend(line.chars());
-                },
-                Err(e) => return Some(Err(e)),
-            }
-        }
-    }
 }
 
 impl<S> Stream<S>
-where S: Iterator<Item = io::Result<char>>
+where S: Iterator<Item = char>
 {
-    fn new(s: S, stdin: bool) -> Self {
-        Self { s: s.peekable(), line_num: 1, unread: Vec::new(), stdin }
+    fn new(s: S) -> Self {
+        Self { s: s.peekable(), line_num: 1, unread: Vec::new() }
     }
 
-    fn peek_char(&mut self) -> io::Result<Option<char>> {
+    fn peek_char(&mut self) -> Option<char> {
         if let Some(c) = self.unread.last() {
-            Ok(Some(*c))
+            Some(*c)
         } else {
-            match self.s.peek() {
-                Some(Ok(c)) => Ok(Some(*c)),
-                Some(Err(e)) => Err(io::Error::new(e.kind(), e.to_string())),
-                None => Ok(None),
-            }
+            self.s.peek().map(|c| *c)
         }
     }
 
-    fn read_char(&mut self) -> io::Result<Option<char>> {
+    fn read_char(&mut self) -> Option<char> {
         let c = if let Some(c) = self.unread.pop() {
             c
         } else {
             match self.s.next() {
-                Some(c) => c?,
-                None => return Ok(None),
+                Some(c) => c,
+                None => return None,
             }
         };
         if c == '\n' {
             self.line_num += 1;
         }
-        Ok(Some(c))
+        Some(c)
     }
 
     fn unread_char(&mut self, c: char) {
@@ -141,34 +91,32 @@ where S: Iterator<Item = io::Result<char>>
         self.unread.push(c);
     }
 
-    fn eat_whitespace(&mut self) -> io::Result<()> {
-        while let Some(c) = self.peek_char()? {
+    fn eat_whitespace(&mut self) {
+        while let Some(c) = self.peek_char() {
             if c.is_whitespace() {
-                _ = self.read_char()?;
+                _ = self.read_char();
             } else {
                 break;
             }
         }
-        Ok(())
     }
 
-    fn eat_comment(&mut self) -> io::Result<()> {
-        while let Some(c) = self.read_char()? {
+    fn eat_comment(&mut self) {
+        while let Some(c) = self.read_char() {
             if c == '\n' {
                 break;
             }
         }
-        Ok(())
     }
 
-    fn read_fixnum(&mut self, first: char) -> Result<Value, Parsed> {
+    fn read_fixnum(&mut self, first: char) -> Result<Value, ParseError> {
         assert!(first == '-' || first.is_digit(10));
         let is_negative = first == '-';
 
         let mut acc: i64 = if is_negative { 0 } else { (first as u8 - b'0') as i64 };
-        while let Some(c) = self.peek_char().map_err(|e| Parsed::Io(e))? {
+        while let Some(c) = self.peek_char() {
             if let Some(d) = c.to_digit(10) {
-                _ = self.read_char().map_err(|e| Parsed::Io(e))?;
+                _ = self.read_char();
                 acc = acc * 10 + d as i64;
             } else {
                 break;
@@ -183,16 +131,16 @@ where S: Iterator<Item = io::Result<char>>
     }
 
     /// None means eof
-    fn read_value(&mut self) -> Result<Value, Parsed> {
-        self.eat_whitespace().map_err(|e| Parsed::Io(e))?;
+    fn read_value(&mut self) -> Result<Value, ParseError> {
+        self.eat_whitespace();
 
-        let c = match self.read_char().map_err(|e| Parsed::Io(e))? {
+        let c = match self.read_char() {
             Some(c) => c,
-            None => return Err(Parsed::Eof),
+            None => return Err(ParseError::Eof),
         };
 
         if c == ';' {
-            self.eat_comment().map_err(|e| Parsed::Io(e))?;
+            self.eat_comment();
             return self.read_value();
         }
 
@@ -203,7 +151,7 @@ where S: Iterator<Item = io::Result<char>>
         if symbol_start(c) {
             let mut acc = c.to_string();
             loop {
-                if let Some(nc) = self.read_char().map_err(|e| Parsed::Io(e))? {
+                if let Some(nc) = self.read_char() {
                     let is_delim = match nc {
                         '"'|'('|')'|'{'|'}'|';' => true,
                         nc => nc.is_whitespace(),
@@ -223,7 +171,7 @@ where S: Iterator<Item = io::Result<char>>
         }
 
         if c == '#' {
-            match self.read_char().map_err(|e| Parsed::Io(e))? {
+            match self.read_char() {
                 Some('t') => return Ok(Value::Bool(true)),
                 Some('f') => return Ok(Value::Bool(false)),
                 Some(_) | None => { },
@@ -233,16 +181,16 @@ where S: Iterator<Item = io::Result<char>>
         if c == '(' {
             let mut acc = Value::Nil;
             loop {
-                self.eat_whitespace().map_err(|e| Parsed::Io(e))?;
-                let nc = self.read_char().map_err(|e| Parsed::Io(e))?;
+                self.eat_whitespace();
+                let nc = self.read_char();
                 if nc.is_none() {
-                    return Err(Parsed::Lisp(LispError::Parse("unexpected eof in list".to_string())));
+                    return Err(ParseError::Lisp(LispError::Parse("unexpected eof in list".to_string())));
                 }
 
                 let nc = nc.unwrap();
 
                 if nc == ')' {
-                    return reverse_list(acc) .map_err(|e| Parsed::Lisp(LispError::Parse(e)));
+                    return reverse_list(acc) .map_err(|e| ParseError::Lisp(LispError::Parse(e)));
                 }
 
                 self.unread_char(nc);
@@ -256,24 +204,17 @@ where S: Iterator<Item = io::Result<char>>
         }
 
         let s = format!("unexpected char: {}", c);
-        Err(Parsed::Lisp(LispError::Parse(s)))
+        Err(ParseError::Lisp(LispError::Parse(s)))
     }
 }
 
-impl Stream<std::vec::IntoIter<io::Result<char>>> {
+impl Stream<std::vec::IntoIter<char>> {
     fn from_str(s: &str) -> Self {
         let iter = s
             .chars()
-            .map(|c| Ok::<char, io::Error>(c))
-            .collect::<Vec<io::Result<char>>>()
+            .collect::<Vec<char>>()
             .into_iter();
-        Self::new(iter, false)
-    }
-}
-
-impl Stream<StdinIter> {
-    fn from_stdin() -> Self {
-        Self::new(StdinIter::new(), true)
+        Self::new(iter)
     }
 }
 
@@ -1004,19 +945,14 @@ impl fmt::Display for Value {
     }
 }
 
-fn repl<S: Iterator<Item = Result<char, io::Error>>>(
+fn repl<S: Iterator<Item = char>>(
     stream: &mut Stream<S>,
     env: Env,
-) -> io::Result<()> {
-    use Parsed::*;
+) -> io::Result<Env> {
+    use ParseError::*;
 
     let mut e = env;
     loop {
-        if stream.stdin {
-            print!("> ");
-            _ = io::stdout().flush()?;
-        }
-
         let expr = match stream.read_value() {
             Ok(v) => v,
             Err(Eof) => break,
@@ -1024,10 +960,6 @@ fn repl<S: Iterator<Item = Result<char, io::Error>>>(
                 println!("error: lisp: {e}");
                 continue;
             }
-            Err(Io(e)) => {
-                println!("error: io: {e}");
-                continue;
-            },
         };
 
         let ast = match expr.build_ast() {
@@ -1049,10 +981,13 @@ fn repl<S: Iterator<Item = Result<char, io::Error>>>(
 
         println!("{result}");
     }
-    Ok(())
+    Ok(e)
 }
 
-fn main() -> io::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use rustyline::error::ReadlineError;
+    use rustyline::DefaultEditor;
+
     let args: Vec<String> = std::env::args().collect();
     if let Some(path) = args.get(1) {
         let p = std::path::Path::new(path);
@@ -1063,12 +998,26 @@ fn main() -> io::Result<()> {
 
         let s = String::from_utf8(buf).unwrap_or_else(|_| panic!("bad..."));
         let mut stream = Stream::from_str(s.as_str());
-        repl(&mut stream, Env::basis())?;
+        _ = repl(&mut stream, Env::basis())?;
         return Ok(());
     }
 
-    let mut stream = Stream::from_stdin();
-    repl(&mut stream, Env::basis())?;
+    let mut rl = DefaultEditor::new()?;
+    let mut env = Env::basis();
+    loop {
+        let readline = rl.readline("$> ");
+        match readline {
+            Ok(line) => {
+                let mut stream = Stream::from_str(line.as_str());
+                env = repl(&mut stream, env)?;
+            },
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
+            Err(err) => {
+                println!("Error: {:?}", err);
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1076,7 +1025,7 @@ fn main() -> io::Result<()> {
 mod tests {
     use super::*;
 
-    fn parse(input: &str) -> Result<Value, Parsed> {
+    fn parse(input: &str) -> Result<Value, ParseError> {
         let mut s = Stream::from_str(input);
         s.read_value()
     }
@@ -1095,28 +1044,28 @@ mod tests {
     fn read_char() {
         let mut s = Stream::from_str("hello  \n\t world");
 
-        assert_eq!(s.read_char().unwrap().unwrap(), 'h');
-        assert_eq!(s.read_char().unwrap().unwrap(), 'e');
-        assert_eq!(s.read_char().unwrap().unwrap(), 'l');
-        assert_eq!(s.read_char().unwrap().unwrap(), 'l');
-        assert_eq!(s.read_char().unwrap().unwrap(), 'o');
-        assert_eq!(s.read_char().unwrap().unwrap(), ' ');
-        assert_eq!(s.read_char().unwrap().unwrap(), ' ');
+        assert_eq!(s.read_char().unwrap(), 'h');
+        assert_eq!(s.read_char().unwrap(), 'e');
+        assert_eq!(s.read_char().unwrap(), 'l');
+        assert_eq!(s.read_char().unwrap(), 'l');
+        assert_eq!(s.read_char().unwrap(), 'o');
+        assert_eq!(s.read_char().unwrap(), ' ');
+        assert_eq!(s.read_char().unwrap(), ' ');
 
         assert_eq!(s.line_num, 1);
-        assert_eq!(s.read_char().unwrap().unwrap(), '\n');
+        assert_eq!(s.read_char().unwrap(), '\n');
         assert_eq!(s.line_num, 2);
 
-        assert_eq!(s.read_char().unwrap().unwrap(), '\t');
+        assert_eq!(s.read_char().unwrap(), '\t');
         assert_eq!(s.line_num, 2);
 
-        assert_eq!(s.read_char().unwrap().unwrap(), ' ');
-        assert_eq!(s.read_char().unwrap().unwrap(), 'w');
-        assert_eq!(s.read_char().unwrap().unwrap(), 'o');
-        assert_eq!(s.read_char().unwrap().unwrap(), 'r');
-        assert_eq!(s.read_char().unwrap().unwrap(), 'l');
-        assert_eq!(s.read_char().unwrap().unwrap(), 'd');
-        assert_eq!(s.read_char().unwrap(), None); // eof
+        assert_eq!(s.read_char().unwrap(), ' ');
+        assert_eq!(s.read_char().unwrap(), 'w');
+        assert_eq!(s.read_char().unwrap(), 'o');
+        assert_eq!(s.read_char().unwrap(), 'r');
+        assert_eq!(s.read_char().unwrap(), 'l');
+        assert_eq!(s.read_char().unwrap(), 'd');
+        assert_eq!(s.read_char(), None); // eof
     }
 
     #[test]
@@ -1137,23 +1086,23 @@ mod tests {
     fn unread_char() {
         let mut s = Stream::from_str("ab\nc");
 
-        assert_eq!(s.read_char().unwrap().unwrap(), 'a');
+        assert_eq!(s.read_char().unwrap(), 'a');
         s.unread_char('a');
-        assert_eq!(s.peek_char().unwrap().unwrap(), 'a');
-        assert_eq!(s.read_char().unwrap().unwrap(), 'a');
-        assert_eq!(s.read_char().unwrap().unwrap(), 'b');
+        assert_eq!(s.peek_char().unwrap(), 'a');
+        assert_eq!(s.read_char().unwrap(), 'a');
+        assert_eq!(s.read_char().unwrap(), 'b');
 
         assert_eq!(s.line_num, 1);
-        assert_eq!(s.read_char().unwrap().unwrap(), '\n');
+        assert_eq!(s.read_char().unwrap(), '\n');
         assert_eq!(s.line_num, 2);
         s.unread_char('\n');
         assert_eq!(s.line_num, 1);
-        assert_eq!(s.peek_char().unwrap().unwrap(), '\n');
-        assert_eq!(s.read_char().unwrap().unwrap(), '\n');
+        assert_eq!(s.peek_char().unwrap(), '\n');
+        assert_eq!(s.read_char().unwrap(), '\n');
         assert_eq!(s.line_num, 2);
 
-        assert_eq!(s.read_char().unwrap().unwrap(), 'c');
-        assert_eq!(s.read_char().unwrap(), None);
+        assert_eq!(s.read_char().unwrap(), 'c');
+        assert_eq!(s.read_char(), None);
     }
 
     #[test]
@@ -1179,10 +1128,10 @@ mod tests {
     #[test]
     fn parse_errors() {
         assert!(
-            matches!(parse("("), Err(Parsed::Lisp(LispError::Parse(e))) if e.contains("unexpected eof in list"))
+            matches!(parse("("), Err(ParseError::Lisp(LispError::Parse(e))) if e.contains("unexpected eof in list"))
         );
         assert!(
-            matches!(parse(")"), Err(Parsed::Lisp(LispError::Parse(e))) if e.contains("unexpected char"))
+            matches!(parse(")"), Err(ParseError::Lisp(LispError::Parse(e))) if e.contains("unexpected char"))
         );
     }
 
