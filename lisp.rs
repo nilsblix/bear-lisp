@@ -152,7 +152,7 @@ impl<R: LineSource> Stream<R> {
         Ok(())
     }
 
-    fn read_fixnum(&mut self, first: char) -> Result<LO, End> {
+    fn read_fixnum(&mut self, first: char) -> Result<Value, End> {
         assert!(first == '-' || first.is_digit(10));
         let is_negative = first == '-';
 
@@ -170,10 +170,10 @@ impl<R: LineSource> Stream<R> {
             acc *= -1;
         }
 
-        Ok(LO::Fixnum(acc))
+        Ok(Value::Fixnum(acc))
     }
 
-    fn read_lo(&mut self) -> Result<LO, End> {
+    fn read_value(&mut self) -> Result<Value, End> {
         self.eat_whitespace().map_err(|e| End::Io(e))?;
 
         let c = match self.read_char().map_err(|e| End::Io(e))? {
@@ -183,7 +183,7 @@ impl<R: LineSource> Stream<R> {
 
         if c == ';' {
             self.eat_comment().map_err(|e| End::Io(e))?;
-            return self.read_lo();
+            return self.read_value();
         }
 
         if c.is_ascii_digit() || c == '~' {
@@ -209,19 +209,19 @@ impl<R: LineSource> Stream<R> {
 
                 break;
             }
-            return Ok(LO::Symbol(acc));
+            return Ok(Value::Symbol(acc));
         }
 
         if c == '#' {
             match self.read_char().map_err(|e| End::Io(e))? {
-                Some('t') => return Ok(LO::Bool(true)),
-                Some('f') => return Ok(LO::Bool(false)),
+                Some('t') => return Ok(Value::Bool(true)),
+                Some('f') => return Ok(Value::Bool(false)),
                 Some(_) | None => { },
             }
         }
 
         if c == '(' {
-            let mut acc = LO::Nil;
+            let mut acc = Value::Nil;
             loop {
                 self.eat_whitespace().map_err(|e| End::Io(e))?;
                 let nc = self.read_char().map_err(|e| End::Io(e))?;
@@ -236,13 +236,13 @@ impl<R: LineSource> Stream<R> {
                 }
 
                 self.unread_char(nc);
-                let car = self.read_lo()?;
-                acc = LO::Pair(Box::new((car, acc)));
+                let car = self.read_value()?;
+                acc = Value::Pair(Box::new((car, acc)));
             }
         }
 
         if c == '\'' {
-            return Ok(LO::Quote(Box::new(self.read_lo()?)));
+            return Ok(Value::Quote(Box::new(self.read_value()?)));
         }
 
         let s = format!("unexpected char: {}", c);
@@ -252,7 +252,7 @@ impl<R: LineSource> Stream<R> {
 
 #[derive(Debug, PartialEq, Clone)]
 struct Env {
-    items: Vec<(String, Rc<RefCell<Option<LO>>>)>,
+    items: Vec<(String, Rc<RefCell<Option<Value>>>)>,
 }
 
 impl Env {
@@ -260,7 +260,7 @@ impl Env {
         Self { items: Vec::new() }
     }
 
-    fn bind_rc(mut self, name: String, b: Rc<RefCell<Option<LO>>>) -> Self {
+    fn bind_rc(mut self, name: String, b: Rc<RefCell<Option<Value>>>) -> Self {
         // This optimization doesn't produce weird shadowing effects in 'let' due to let creating a
         // temporary env, therefore simply overwriting the last value.
         if let Some(item) = self.items.last_mut() {
@@ -273,22 +273,22 @@ impl Env {
         self
     }
 
-    fn bind(self, name: String, value: LO) -> Self {
+    fn bind(self, name: String, value: Value) -> Self {
         self.bind_rc(name, Rc::new(RefCell::new(Some(value))))
     }
 
-    fn make_loc() -> Rc<RefCell<Option<LO>>> {
+    fn make_loc() -> Rc<RefCell<Option<Value>>> {
         Rc::new(RefCell::new(None))
     }
 
-    fn bind_list(mut self, bindings: Vec<(String, LO)>) -> Self {
+    fn bind_list(mut self, bindings: Vec<(String, Value)>) -> Self {
         for (n, v) in bindings.iter() {
             self = self.bind(n.clone(), v.clone());
         }
         self
     }
 
-    fn lookup(&self, name: &str) -> Result<LO, LispError> {
+    fn lookup(&self, name: &str) -> Result<Value, LispError> {
         let rm = self.lookup_mut(name)?;
         match rm.as_ref() {
             Some(lo) => Ok(lo.clone()),
@@ -299,7 +299,7 @@ impl Env {
         }
     }
 
-    fn lookup_mut(&self, name: &str) -> Result<RefMut<'_, Option<LO>>, LispError> {
+    fn lookup_mut(&self, name: &str) -> Result<RefMut<'_, Option<Value>>, LispError> {
         for (n, cell) in self.items.iter().rev() {
             if n == name {
                 return Ok(cell.borrow_mut());
@@ -311,8 +311,8 @@ impl Env {
     }
 
     fn basis() -> Env {
-        use LO::Primitive;
-        fn num_args(name: &str, n: usize, args: &[&LO]) -> Result<(), LispError> {
+        use Value::Primitive;
+        fn num_args(name: &str, n: usize, args: &[&Value]) -> Result<(), LispError> {
             if args.len() != n {
                 let s = format!("'{}' primitive expects '{}' number of arguments, found, '{}'" ,
                     name, n, args.len());
@@ -326,7 +326,7 @@ impl Env {
             ($name:literal, $ctor:path, $op:tt) => {
                 Primitive($name.to_string(), |args| {
                     num_args($name, 2, args)?;
-                    if let (LO::Fixnum(a), LO::Fixnum(b)) = (args[0], args[1]) {
+                    if let (Value::Fixnum(a), Value::Fixnum(b)) = (args[0], args[1]) {
                         Ok($ctor(a $op b))
                     } else {
                         let s = format!("'{}' primitive expects integer arguments, found '{}' and '{}'",
@@ -339,20 +339,20 @@ impl Env {
 
         let prim_eq = Primitive("eq".to_string(), |args| {
             num_args("eq", 2, args)?;
-            Ok(LO::Bool(args[0] == args[1]))
+            Ok(Value::Bool(args[0] == args[1]))
         });
 
         let prim_pair = Primitive("pair".to_string(), |args| {
             num_args("pair", 2, args)?;
-            Ok(LO::Pair(Box::new((args[0].clone(), args[1].clone()))))
+            Ok(Value::Pair(Box::new((args[0].clone(), args[1].clone()))))
         });
 
 
         let prim_list = Primitive("list".to_string(), |args| {
-            fn prim_list(args: &[&LO]) -> LO {
+            fn prim_list(args: &[&Value]) -> Value {
                 match args {
-                    [] => LO::Nil,
-                    [car, cdr @ ..] => LO::Pair(Box::new(((*car).clone(), prim_list(cdr)))),
+                    [] => Value::Nil,
+                    [car, cdr @ ..] => Value::Pair(Box::new(((*car).clone(), prim_list(cdr)))),
                 }
             }
             Ok(prim_list(args))
@@ -360,7 +360,7 @@ impl Env {
 
         let prim_car = Primitive("car".to_string(), |args| {
             num_args("car", 1, args)?;
-            if let LO::Pair(p) = args[0] {
+            if let Value::Pair(p) = args[0] {
                 return Ok(p.0.clone());
             }
 
@@ -370,7 +370,7 @@ impl Env {
 
         let prim_cdr = Primitive("cdr".to_string(), |args| {
             num_args("car", 1, args)?;
-            if let LO::Pair(p) = args[0] {
+            if let Value::Pair(p) = args[0] {
                 return Ok(p.1.clone());
             }
 
@@ -380,19 +380,19 @@ impl Env {
 
         let prim_atomp = Primitive("atom?".to_string(), |args| {
             num_args("atom?", 1, args)?;
-            if let LO::Pair(_) = args[0] {
-                Ok(LO::Bool(false))
+            if let Value::Pair(_) = args[0] {
+                Ok(Value::Bool(false))
             } else {
-                Ok(LO::Bool(true))
+                Ok(Value::Bool(true))
             }
         });
 
         let prim_symp = Primitive("sym?".to_string(), |args| {
             num_args("sym?", 1, args)?;
-            if let LO::Symbol(_) = args[0] {
-                Ok(LO::Bool(true))
+            if let Value::Symbol(_) = args[0] {
+                Ok(Value::Bool(true))
             } else {
-                Ok(LO::Bool(false))
+                Ok(Value::Bool(false))
             }
         });
 
@@ -401,8 +401,8 @@ impl Env {
             let mut handle = io::stdin().lock();
             let mut buf = [0u8; 1];
             match handle.read(&mut buf) {
-                Ok(0) => Ok(LO::Fixnum(-1)), // eof
-                Ok(_) => Ok(LO::Fixnum(buf[0] as i64)),
+                Ok(0) => Ok(Value::Fixnum(-1)), // eof
+                Ok(_) => Ok(Value::Fixnum(buf[0] as i64)),
                 Err(e) => Err(LispError::Primitive(format!("io error in 'getchar': {}", e))),
             }
         });
@@ -411,12 +411,12 @@ impl Env {
             num_args("print", 1, args)?;
             print!("{}", &args[0].to_string());
             _ = io::stdout().flush();
-            Ok(LO::Symbol("ok".to_string()))
+            Ok(Value::Symbol("ok".to_string()))
         });
 
         let prim_itoc = Primitive("itoc".to_string(), |args| {
             num_args("itoc", 1, args)?;
-            if let LO::Fixnum(i) = args[0] {
+            if let Value::Fixnum(i) = args[0] {
                 let c = match char::from_u32(*i as u32) {
                     Some(x) => x,
                     None => {
@@ -424,7 +424,7 @@ impl Env {
                         return Err(LispError::Primitive(s));
                     },
                 };
-                Ok(LO::Symbol(c.to_string()))
+                Ok(Value::Symbol(c.to_string()))
 
             } else {
                 let s = format!("'itoc' primitive expects one integer argument, found: '{}'", args[0]);
@@ -434,8 +434,8 @@ impl Env {
 
         let prim_cat = Primitive("cat".to_string(), |args| {
             num_args("cat", 2, args)?;
-            if let (LO::Symbol(a), LO::Symbol(b)) = (args[0], args[1]) {
-                Ok(LO::Symbol(format!("{}{}", a, b)))
+            if let (Value::Symbol(a), Value::Symbol(b)) = (args[0], args[1]) {
+                Ok(Value::Symbol(format!("{}{}", a, b)))
             } else {
                 let s = format!("'cat' primitive expects two symbol arguments, found: '{}' and '{}'",
                     args[0], args[1]);
@@ -445,8 +445,8 @@ impl Env {
 
         let prim_div = Primitive("/".to_string(), |args| {
             num_args("/", 2, args)?;
-            if let (LO::Fixnum(a), LO::Fixnum(b)) = (args[0], args[1]) {
-                Ok(LO::Fixnum(a / b))
+            if let (Value::Fixnum(a), Value::Fixnum(b)) = (args[0], args[1]) {
+                Ok(Value::Fixnum(a / b))
             } else {
                 let s = format!("'cat' primitive expects two integer arguments, found: '{}' and '{}'",
                     args[0], args[1]);
@@ -454,12 +454,12 @@ impl Env {
             }
         });
 
-        let prim_add = bin_fixnum_prim!("+", LO::Fixnum, +);
-        let prim_sub = bin_fixnum_prim!("-", LO::Fixnum, -);
-        let prim_mult = bin_fixnum_prim!("*", LO::Fixnum, *);
-        let prim_le = bin_fixnum_prim!("<", LO::Bool, <);
-        let prim_gt = bin_fixnum_prim!(">", LO::Bool, >);
-        let prim_int_eq = bin_fixnum_prim!("=", LO::Bool, ==);
+        let prim_add = bin_fixnum_prim!("+", Value::Fixnum, +);
+        let prim_sub = bin_fixnum_prim!("-", Value::Fixnum, -);
+        let prim_mult = bin_fixnum_prim!("*", Value::Fixnum, *);
+        let prim_le = bin_fixnum_prim!("<", Value::Bool, <);
+        let prim_gt = bin_fixnum_prim!(">", Value::Bool, >);
+        let prim_int_eq = bin_fixnum_prim!("=", Value::Bool, ==);
 
         let env = Env::new();
         let env = env.bind("+".to_string(), prim_add);
@@ -483,16 +483,16 @@ impl Env {
         env
     }
 
-    fn to_lo(&self) -> LO {
-        let los: Vec<LO> = self.items
+    fn to_lo(&self) -> Value {
+        let los: Vec<Value> = self.items
             .iter()
             .map(|(n, v)|
-                LO::Pair(Box::new((LO::Symbol(n.clone()), match v.borrow().as_ref() {
+                Value::Pair(Box::new((Value::Symbol(n.clone()), match v.borrow().as_ref() {
                     Some(lo) => lo.clone(),
-                    None => LO::Symbol("#<unspecified value>".to_string()),
+                    None => Value::Symbol("#<unspecified value>".to_string()),
                 })))
             ).collect();
-        LO::list_to_pair(los)
+        Value::list_to_pair(los)
     }
 }
 
@@ -505,25 +505,25 @@ impl fmt::Display for Env {
 
 /// Left-object
 #[derive(Debug, PartialEq, Clone)]
-enum LO {
+enum Value {
     Fixnum(i64),
     Bool(bool),
     Symbol(String),
     Nil,
-    Pair(Box<(LO, LO)>),
-    Primitive(String, fn(&[&LO]) -> Result<LO, LispError>),
-    Quote(Box<LO>),
+    Pair(Box<(Value, Value)>),
+    Primitive(String, fn(&[&Value]) -> Result<Value, LispError>),
+    Quote(Box<Value>),
     Closure(Vec<String>, Box<Expr>, Env),
 }
 
-fn reverse_list(mut xs: LO) -> Result<LO, String> {
-    let mut out = LO::Nil;
+fn reverse_list(mut xs: Value) -> Result<Value, String> {
+    let mut out = Value::Nil;
     loop {
         match xs {
-            LO::Nil => return Ok(out),
-            LO::Pair(cell) => {
+            Value::Nil => return Ok(out),
+            Value::Pair(cell) => {
                 let (car, cdr) = *cell;
-                out = LO::Pair(Box::new((car, out)));
+                out = Value::Pair(Box::new((car, out)));
                 xs = cdr;
             },
             _ => return Err("malformed list".to_string()),
@@ -548,17 +548,17 @@ fn assert_unique<T: PartialEq + fmt::Display + Clone>(d: &dyn fmt::Display, xs: 
     Ok(())
 }
 
-impl LO {
+impl Value {
     fn is_list(&self) -> bool {
         match self {
-            LO::Nil => true,
-            LO::Pair(cell) => cell.1.is_list(),
+            Value::Nil => true,
+            Value::Pair(cell) => cell.1.is_list(),
             _ => false,
         }
     }
 
     fn build_ast(&self) -> Result<Expr, LispError> {
-        use LO::*;
+        use Value::*;
         match self {
             Primitive(_, _) | Closure(_, _, _) => unreachable!(), // shouldn't happen at this stage.
             Symbol(s) => Ok(Expr::Var(s.clone())),
@@ -578,21 +578,21 @@ impl LO {
                     [sym, e] if matches!(sym, Symbol(s) if s == "quote") =>
                         Ok(Expr::Literal((*e).clone())),
                     [sym, conditions @ ..] if matches!(sym, Symbol(s) if s == "cond") => {
-                        fn cond_to_if(xs: &[&LO]) -> Result<Expr, LispError> {
+                        fn cond_to_if(xs: &[&Value]) -> Result<Expr, LispError> {
                             if xs.is_empty() {
                                 let s = "'cond' expects a list of conditions, found nothing".to_string();
                                 return Err(LispError::Parse(s));
                             }
 
-                            if let LO::Pair(b) = xs[0] {
+                            if let Value::Pair(b) = xs[0] {
                                 let (cond, cell) = b.as_ref();
-                                if let LO::Pair(b) = cell {
-                                    if b.1 == LO::Nil {
+                                if let Value::Pair(b) = cell {
+                                    if b.1 == Value::Nil {
                                         let rest = b.0.clone();
                                         let cond_ast = cond.build_ast()?;
                                         let rest_ast = rest.build_ast()?;
                                         let conds = if xs.len() == 1 {
-                                            Expr::Literal(LO::Symbol("error".to_string()))
+                                            Expr::Literal(Value::Symbol("error".to_string()))
                                         } else {
                                             cond_to_if(&xs[1..])?
                                         };
@@ -643,7 +643,7 @@ impl LO {
                     [Symbol(s), bindings, exp] if bindings.is_list() && Lets::is_valid(s) => {
                         let l = Lets::map(s).unwrap();
 
-                        fn make_binding(b: &LO) -> Result<(String, Expr), LispError> {
+                        fn make_binding(b: &Value) -> Result<(String, Expr), LispError> {
                             if let Pair(b) = b {
                                 if let (Symbol(n), Pair(b)) = b.as_ref() {
                                     if let (e, Nil) = b.as_ref() {
@@ -695,27 +695,27 @@ impl LO {
         }
     }
 
-    fn pair_to_list(&self) -> Vec<&LO> {
+    fn pair_to_list(&self) -> Vec<&Value> {
         let mut out = Vec::new();
         let mut p = self;
         loop {
             match p {
-                LO::Pair(cell) => {
+                Value::Pair(cell) => {
                     let (fst, snd) = cell.as_ref();
                     out.push(fst);
                     p = snd;
                 },
-                LO::Nil => break,
+                Value::Nil => break,
                 _ => panic!("malformed list"),
             }
         }
         out
     }
 
-    fn list_to_pair(xs: Vec<LO>) -> LO {
-        let mut acc = LO::Nil;
-        for lo in xs.into_iter().rev() {
-            acc = LO::Pair(Box::new((lo, acc)));
+    fn list_to_pair(xs: Vec<Value>) -> Value {
+        let mut acc = Value::Nil;
+        for v in xs.into_iter().rev() {
+            acc = Value::Pair(Box::new((v, acc)));
         }
         acc
     }
@@ -723,7 +723,7 @@ impl LO {
 
 #[derive(Debug, PartialEq, Clone)]
 enum Expr {
-    Literal(LO),
+    Literal(Value),
     Var(String),
     If(Box<(Expr, Expr, Expr)>),
     And(Box<(Expr, Expr)>),
@@ -777,7 +777,7 @@ enum Definition {
 fn eval_bindings(
     bindings: &Vec<(String, Box<Expr>)>,
     env: &Env
-) -> Result<Vec<(String, LO)>, LispError> {
+) -> Result<Vec<(String, Value)>, LispError> {
     bindings
         .iter()
         .map(|(name, expr)| {
@@ -788,7 +788,7 @@ fn eval_bindings(
 }
 
 impl Expr {
-    fn eval(&self, env: Env) -> Result<(LO, Env), LispError> {
+    fn eval(&self, env: Env) -> Result<(Value, Env), LispError> {
         match self {
             Expr::Def(d) => Expr::eval_def(d, env),
             e => Ok((e.eval_expr(&env)?, env)),
@@ -796,7 +796,7 @@ impl Expr {
     }
 
     /// Returns the modified env.
-    fn eval_def(def: &Definition, env: Env) -> Result<(LO, Env), LispError> {
+    fn eval_def(def: &Definition, env: Env) -> Result<(Value, Env), LispError> {
         match def {
             Definition::Val(n, e) => {
                 let v = e.eval_expr(&env)?;
@@ -806,14 +806,14 @@ impl Expr {
             Definition::Fun(n, ns, e) => {
                 let lambda = Expr::Lambda(ns.clone(), Box::new(e.clone()));
                 let (formals, body, cl_env) = match lambda.eval_expr(&env)? {
-                    LO::Closure(fs, body, env) => (fs, body, env),
-                    lo => {
-                        let s = format!("expected a closure to define a function, found: '{}'", lo);
+                    Value::Closure(fs, body, env) => (fs, body, env),
+                    v => {
+                        let s = format!("expected a closure to define a function, found: '{}'", v);
                         return Err(LispError::Type(s));
                     }
                 };
                 let loc = Env::make_loc();
-                let clo = LO::Closure(formals, body, cl_env.bind_rc(n.to_string(), loc.clone()));
+                let clo = Value::Closure(formals, body, cl_env.bind_rc(n.to_string(), loc.clone()));
                 *loc.borrow_mut() = Some(clo.clone());
                 Ok((clo, env.bind_rc(n.to_string(), loc)))
             },
@@ -821,24 +821,24 @@ impl Expr {
     }
 
     /// Does not modify env, and returns the evaluated expression.
-    fn eval_expr(&self, env: &Env) -> Result<LO, LispError> {
+    fn eval_expr(&self, env: &Env) -> Result<Value, LispError> {
         use Expr::*;
 
         match self {
             Def(_) => unreachable!(),
-            Literal(LO::Quote(b)) => Ok(*b.clone()),
+            Literal(Value::Quote(b)) => Ok(*b.clone()),
             Literal(l) => Ok(l.clone()),
             Var(n) => env.lookup(&n),
             If(b) => match (*b).0.eval_expr(env)? {
-                LO::Bool(true) => Ok((*b).1.eval_expr(env)?),
-                LO::Bool(false) => Ok((*b).2.eval_expr(env)?),
+                Value::Bool(true) => Ok((*b).1.eval_expr(env)?),
+                Value::Bool(false) => Ok((*b).2.eval_expr(env)?),
                 other => {
                     let s = format!("if statement condition did not resolve to a bool, found: '{}'", other);
                     Err(LispError::Type(s))
                 },
             },
             And(b) => match ((*b).0.eval_expr(env)?, (*b).1.eval_expr(env)?) {
-                (LO::Bool(v1), LO::Bool(v2)) => Ok(LO::Bool(v1 && v2)),
+                (Value::Bool(v1), Value::Bool(v2)) => Ok(Value::Bool(v1 && v2)),
                 (v1, v2) => {
                     let s = format!("and statement conditions did not resolve to bools, found: '{}' and '{}'",
                         v1, v2);
@@ -846,7 +846,7 @@ impl Expr {
                 },
             },
             Or(b) => match ((*b).0.eval_expr(env)?, (*b).1.eval_expr(env)?) {
-                (LO::Bool(v1), LO::Bool(v2)) => Ok(LO::Bool(v1 || v2)),
+                (Value::Bool(v1), Value::Bool(v2)) => Ok(Value::Bool(v1 || v2)),
                 (v1, v2) => {
                     let s = format!("or statement conditions did not resolve to bools, found: '{}' and '{}'",
                         v1, v2);
@@ -871,15 +871,15 @@ impl Expr {
             Call(b) => {
                 if let (Expr::Var(name), true) = (&(*b).0, (*b).1.is_empty()) {
                     if name == "env" {
-                        let los: Vec<LO> = env.items
+                        let vs: Vec<Value> = env.items
                             .iter()
                             .map(|(n, v)|
-                                LO::Pair(Box::new((LO::Symbol(n.clone()), match v.borrow().as_ref() {
-                                    Some(lo) => lo.clone(),
-                                    None => LO::Symbol("#<unspecified value>".to_string()),
+                                Value::Pair(Box::new((Value::Symbol(n.clone()), match v.borrow().as_ref() {
+                                    Some(v) => v.clone(),
+                                    None => Value::Symbol("#<unspecified value>".to_string()),
                                 })))
                             ).collect();
-                        let env = LO::list_to_pair(los);
+                        let env = Value::list_to_pair(vs);
                         return Ok(env.clone());
                     }
                 }
@@ -894,7 +894,7 @@ impl Expr {
 
                 Expr::eval_apply(f, primed)
             },
-            Lambda(ns, e) => Ok(LO::Closure(ns.clone(), e.clone(), env.clone())),
+            Lambda(ns, e) => Ok(Value::Closure(ns.clone(), e.clone(), env.clone())),
             Let(Lets::Fixed, bindings, body) => {
                 let mapped = eval_bindings(bindings, env)?;
                 body.eval_expr(&env.clone().bind_list(mapped))
@@ -902,8 +902,8 @@ impl Expr {
             Let(Lets::Star, bindings, body) => {
                 let mut bound_env = env.clone();
                 for (name, b) in bindings.iter() {
-                    let lo = b.eval_expr(&bound_env)?;
-                    bound_env = bound_env.bind(name.clone(), lo);
+                    let v = b.eval_expr(&bound_env)?;
+                    bound_env = bound_env.bind(name.clone(), v);
                 }
                 body.eval_expr(&bound_env)
             },
@@ -923,11 +923,11 @@ impl Expr {
         }
     }
 
-    fn eval_apply(f: LO, values: Vec<LO>) -> Result<LO, LispError> {
+    fn eval_apply(f: Value, values: Vec<Value>) -> Result<Value, LispError> {
         match f {
-            LO::Primitive(_, f) => f(values.iter().collect::<Vec<&LO>>().as_slice()),
-            LO::Closure(ns, e, cl_env) => {
-                let zipped: Vec<(String, LO)> = ns
+            Value::Primitive(_, f) => f(values.iter().collect::<Vec<&Value>>().as_slice()),
+            Value::Closure(ns, e, cl_env) => {
+                let zipped: Vec<(String, Value)> = ns
                     .into_iter()
                     .zip(values)
                     .collect();
@@ -941,9 +941,9 @@ impl Expr {
     }
 }
 
-impl fmt::Display for LO {
+impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use LO::*;
+        use Value::*;
 
         match self {
             Fixnum(x) => write!(f, "{x}"),
@@ -987,8 +987,8 @@ fn repl<R: LineSource>(stream: &mut Stream<R>, env: Env, is_stdin: bool) -> io::
             _ = io::stdout().flush()?;
         }
 
-        let expr = match stream.read_lo() {
-            Ok(lo) => lo,
+        let expr = match stream.read_value() {
+            Ok(v) => v,
             Err(Eof) => break,
             Err(Lisp(e)) => {
                 println!("error: lisp: {e}");
@@ -1047,18 +1047,18 @@ mod tests {
     use super::*;
     use io::Cursor;
 
-    fn parse(input: &str) -> Result<LO, End> {
+    fn parse(input: &str) -> Result<Value, End> {
         let mut s = Stream::new(Cursor::new(input));
-        s.read_lo()
+        s.read_value()
     }
 
-    fn eval_result(env: Env, input: &str) -> Result<(LO, Env), LispError> {
+    fn eval_result(env: Env, input: &str) -> Result<(Value, Env), LispError> {
         let e = parse(input).unwrap();
         let ast = e.build_ast()?;
         ast.eval(env)
     }
 
-    fn eval(env: Env, input: &str) -> (LO, Env) {
+    fn eval(env: Env, input: &str) -> (Value, Env) {
         eval_result(env, input).unwrap()
     }
 
@@ -1096,12 +1096,12 @@ mod tests {
         let input = Cursor::new("(1 2 3 4 5 350)");
         let mut s = Stream::new(input);
 
-        let lo = s.read_lo().unwrap();
-        let v = lo.pair_to_list();
-        let exp: Vec<LO> = vec![1 as i64, 2, 3, 4, 5, 350].iter().map(|x| LO::Fixnum(*x)).collect();
-        assert_eq!(v.len(), exp.len());
+        let value = s.read_value().unwrap();
+        let vec = value.pair_to_list();
+        let exp: Vec<Value> = vec![1 as i64, 2, 3, 4, 5, 350].iter().map(|x| Value::Fixnum(*x)).collect();
+        assert_eq!(vec.len(), exp.len());
 
-        for (i, val) in v.iter().enumerate() {
+        for (i, val) in vec.iter().enumerate() {
             assert_eq!(**val, exp[i]);
         }
     }
@@ -1135,21 +1135,21 @@ mod tests {
         let input = Cursor::new("   12   \n15 340 #t #f ~90 hello_world bear-lisp");
         let mut s = Stream::new(input);
 
-        assert_eq!(s.read_lo().unwrap(), LO::Fixnum(12));
+        assert_eq!(s.read_value().unwrap(), Value::Fixnum(12));
         assert_eq!(s.line_num, 1);
-        assert_eq!(s.read_lo().unwrap(), LO::Fixnum(15));
+        assert_eq!(s.read_value().unwrap(), Value::Fixnum(15));
         assert_eq!(s.line_num, 2);
-        assert_eq!(s.read_lo().unwrap(), LO::Fixnum(340));
-        assert_eq!(s.read_lo().unwrap(), LO::Bool(true));
-        assert_eq!(s.read_lo().unwrap(), LO::Bool(false));
-        assert_eq!(s.read_lo().unwrap(), LO::Fixnum(-90));
-        assert_eq!(s.read_lo().unwrap(), LO::Symbol("hello_world".to_string()));
-        assert_eq!(s.read_lo().unwrap(), LO::Symbol("bear-lisp".to_string()));
+        assert_eq!(s.read_value().unwrap(), Value::Fixnum(340));
+        assert_eq!(s.read_value().unwrap(), Value::Bool(true));
+        assert_eq!(s.read_value().unwrap(), Value::Bool(false));
+        assert_eq!(s.read_value().unwrap(), Value::Fixnum(-90));
+        assert_eq!(s.read_value().unwrap(), Value::Symbol("hello_world".to_string()));
+        assert_eq!(s.read_value().unwrap(), Value::Symbol("bear-lisp".to_string()));
 
         let input = Cursor::new("(1 2 hello world) (34 (35 some))");
         let mut s = Stream::new(input);
-        assert_eq!(s.read_lo().unwrap().to_string(), "(1 2 hello world)");
-        assert_eq!(s.read_lo().unwrap().to_string(), "(34 (35 some))");
+        assert_eq!(s.read_value().unwrap().to_string(), "(1 2 hello world)");
+        assert_eq!(s.read_value().unwrap().to_string(), "(34 (35 some))");
     }
 
     #[test]
@@ -1177,8 +1177,8 @@ mod tests {
         let (res, env) = eval(env, "(val y (if x ~12 13))");
         assert_eq!(res.to_string(), "-12");
 
-        assert_eq!(env.lookup("x").unwrap(), LO::Bool(true));
-        assert_eq!(env.lookup("y").unwrap(), LO::Fixnum(-12));
+        assert_eq!(env.lookup("x").unwrap(), Value::Bool(true));
+        assert_eq!(env.lookup("y").unwrap(), Value::Fixnum(-12));
     }
 
     #[test]
@@ -1190,16 +1190,6 @@ mod tests {
         assert_eq!(eval(Env::basis(), "(eq ((lambda (x) (+ x 1)) 10) 11)").0.to_string(), "#t");
         assert_eq!(eval(Env::basis(), "(eq ((lambda (x) (+ x 1)) 10) 12)").0.to_string(), "#f");
         assert_eq!(eval(Env::basis(), "(itoc 128175)").0.to_string().as_str(), "💯");
-
-        // NOTE: should stuff like this be allowed? currently the program experiences stack overflow
-        // when trying to compare functions stored in an env.
-        //
-        // Also trying to implement alpha equivalence might be weird.
-        // let input = Cursor::new("(eq (lambda (x) (x + 1)) (lambda (y) (y + 1)))");
-        // let mut s = Stream::new(input);
-        // let e = s.read_lo().unwrap();
-        // let ast = e.build_ast().unwrap();
-        // assert_eq!(ast.eval(Env::basis()).unwrap().0.to_string(), "#t");
     }
 
     #[test]
@@ -1241,10 +1231,10 @@ mod tests {
     #[test]
     fn eval_applications_and_quotes() {
         let (result, _) = eval(Env::basis(), "(apply + (list 13 14))");
-        assert_eq!(result, LO::Fixnum(27));
+        assert_eq!(result, Value::Fixnum(27));
 
         let (result, _) = eval(Env::basis(), "(apply + '((if #t ~12 13) 14))");
-        assert_eq!(result, LO::Fixnum(2));
+        assert_eq!(result, Value::Fixnum(2));
 
         let (q1, _) = eval(Env::basis(), "'(if #t 1 2)");
         let (q2, _) = eval(Env::basis(), "(quote (if #t 1 2))");
@@ -1257,11 +1247,11 @@ mod tests {
         let env = Env::basis();
         let (_, env) = eval(env, "(val add-one (lambda (x) (+ x 1)))");
         let (res, env) = eval(env, "(add-one 12)");
-        assert_eq!(res, LO::Fixnum(13));
+        assert_eq!(res, Value::Fixnum(13));
 
         let (_, env) = eval(env, "(val add-three (lambda (x) (add-one (add-one (add-one x)))))");
         let (res, _) = eval(env, "(add-three ~90)");
-        assert_eq!(res, LO::Fixnum(-87));
+        assert_eq!(res, Value::Fixnum(-87));
     }
 
     #[test]
@@ -1269,13 +1259,13 @@ mod tests {
         let env = Env::basis();
         let (_, env) = eval(env, "(define f (x) (if (eq x 0) 1 (* x (f (+ x ~1)))))");
         let (res, env) = eval(env, "(f 4)");
-        assert_eq!(res, LO::Fixnum(24));
+        assert_eq!(res, Value::Fixnum(24));
 
         let (res, env) = eval(env, "(f 5)");
-        assert_eq!(res, LO::Fixnum(120));
+        assert_eq!(res, Value::Fixnum(120));
 
         let (res, _) = eval(env, "(f 6)");
-        assert_eq!(res, LO::Fixnum(720));
+        assert_eq!(res, Value::Fixnum(720));
     }
 
     #[test]
@@ -1316,17 +1306,17 @@ mod tests {
 
         let (_, env) = eval(env, "(val x 34)");
         let (res, _env) = eval(env, "(let ((a (+ x 32))) (+ a 1))");
-        assert_eq!(res, LO::Fixnum(67));
+        assert_eq!(res, Value::Fixnum(67));
     }
 
     #[test]
     fn let_star() {
         let env = Env::basis();
         let (res, env) = eval(env, "(let* ((x 34) (y x)) y)");
-        assert_eq!(res, LO::Fixnum(34));
+        assert_eq!(res, Value::Fixnum(34));
 
         let (res, _env) = eval(env, "(let* ((x 34) (y (+ x 33))) y))");
-        assert_eq!(res, LO::Fixnum(67));
+        assert_eq!(res, Value::Fixnum(67));
     }
 
     #[test]
@@ -1334,16 +1324,16 @@ mod tests {
         let env = Env::basis();
         let (_, env) = eval(env, "(val x 5)");
         let (res, env) = eval(env, "(let* ((x 4) (x (* x 4))) x)");
-        assert_eq!(res, LO::Fixnum(16));
+        assert_eq!(res, Value::Fixnum(16));
 
         let (_, env) = eval(env, "(val y 20)");
         // let ==> y should depend on (val x 5)
         let (res, env) = eval(env, "(let ((x 4) (y (* x x))) (+ x y))");
-        assert_eq!(res, LO::Fixnum(29));
+        assert_eq!(res, Value::Fixnum(29));
 
         // let* ==> y should depend on the previous x
         let (res, _env) = eval(env, "(let* ((x 4) (y (* x x))) (+ x y))");
-        assert_eq!(res, LO::Fixnum(20));
+        assert_eq!(res, Value::Fixnum(20));
     }
 
     #[test]
@@ -1368,13 +1358,27 @@ mod tests {
         let (res, env) = eval(env, "(letrec ((f (lambda (x) (g (+ x 1))))
                                               (g (lambda (x) (+ x 3))))
                                        (f 0))");
-        assert_eq!(res, LO::Fixnum(4));
+        assert_eq!(res, Value::Fixnum(4));
 
         let (res, _env) = eval(env, "(letrec ((factorial (lambda (x) (
                                                             if (< x 2)
                                                               1
                                                               (* x (factorial (- x 1)))))))
                                              (factorial 5))");
-        assert_eq!(res, LO::Fixnum(120));
+        assert_eq!(res, Value::Fixnum(120));
+    }
+
+    #[test]
+    fn composition_function() {
+        let env = Env::basis();
+        let (_, env) = eval(env, "(define o (f g) (lambda (x) (f (g x))))");
+        let (_, env) = eval(env, "(define f (x) (+ x 1))");
+
+        let (res, env) = eval(env, "((o f f) 4)");
+        assert_eq!(res, Value::Fixnum(6));
+
+        let (_, env) = eval(env, "(define factorial (x) (if (< x 2) 1 (* x (factorial (- x 1)))))");
+        let (res, _env) = eval(env, "((o factorial f) 4)");
+        assert_eq!(res, Value::Fixnum(120));
     }
 }
