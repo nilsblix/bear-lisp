@@ -442,8 +442,10 @@ impl Env {
         let prim_add = bin_fixnum_prim!("+", Value::Fixnum, +);
         let prim_sub = bin_fixnum_prim!("-", Value::Fixnum, -);
         let prim_mult = bin_fixnum_prim!("*", Value::Fixnum, *);
-        let prim_le = bin_fixnum_prim!("<", Value::Bool, <);
+        let prim_lt = bin_fixnum_prim!("<", Value::Bool, <);
         let prim_gt = bin_fixnum_prim!(">", Value::Bool, >);
+        let prim_lte = bin_fixnum_prim!("<=", Value::Bool, <=);
+        let prim_gte = bin_fixnum_prim!(">=", Value::Bool, >=);
         let prim_int_eq = bin_fixnum_prim!("=", Value::Bool, ==);
 
         let env = Env::new();
@@ -452,8 +454,10 @@ impl Env {
         let env = env.bind("-".to_string(), prim_sub);
         let env = env.bind("*".to_string(), prim_mult);
         let env = env.bind("/".to_string(), prim_div);
-        let env = env.bind("<".to_string(), prim_le);
+        let env = env.bind("<".to_string(), prim_lt);
         let env = env.bind(">".to_string(), prim_gt);
+        let env = env.bind("<=".to_string(), prim_lte);
+        let env = env.bind(">=".to_string(), prim_gte);
         let env = env.bind("=".to_string(), prim_int_eq);
         let env = env.bind("pair".to_string(), prim_pair);
         let env = env.bind("list".to_string(), prim_list);
@@ -583,7 +587,7 @@ impl Value {
                     [sym, func, args] if matches!(sym, Symbol(s) if s == "apply") =>
                         Ok(Expr::Apply(Box::new((func.build_ast()?, args.build_ast()?)))),
                     [sym, Symbol(n), e] if matches!(sym, Symbol(s) if s == "val") =>
-                        Ok(Expr::Def(Box::new(Definition::Val(n.clone(), e.build_ast()?)))),
+                        Ok(Expr::Val(n.clone(), Box::new(e.build_ast()?))),
                     [sym, e] if matches!(sym, Symbol(s) if s == "quote") =>
                         Ok(Expr::Literal((*e).clone())),
                     [sym, conditions @ ..] if matches!(sym, Symbol(s) if s == "cond") => {
@@ -647,7 +651,11 @@ impl Value {
                             .collect::<Result<Vec<String>, LispError>>()?;
                         assert_unique(&"define", formals.as_slice())?;
                         let ast = e.build_ast()?;
-                        Ok(Expr::Def(Box::new(Definition::Fun(n.clone(), formals, ast))))
+
+                        let var = Expr::Var(n.clone());
+                        let lam = Expr::Lambda(formals, Box::new(ast));
+                        let let_rec = Expr::Let(Lets::Rec, vec![(n.clone(), Box::new(lam))], Box::new(var));
+                        Ok(Expr::Val(n.clone(), Box::new(let_rec)))
                     },
                     [Symbol(s), bindings, exp] if bindings.is_list() && Lets::is_valid(s) => {
                         let l = Lets::map(s).unwrap();
@@ -740,9 +748,8 @@ enum Expr {
     Apply(Box<(Expr, Expr)>),
     Call(Box<(Expr, Vec<Expr>)>),
     Lambda(Vec<String>, Box<Expr>),
-    /// (kind, bindings, in)
     Let(Lets, Vec<(String, Box<Expr>)>, Box<Expr>),
-    Def(Box<Definition>),
+    Val(String, Box<Expr>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -777,12 +784,6 @@ impl fmt::Display for Lets {
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
-enum Definition {
-    Val(String, Expr),
-    Fun(String, Vec<String>, Expr),
-}
-
 fn eval_bindings(
     bindings: &Vec<(String, Box<Expr>)>,
     env: &Env
@@ -799,34 +800,16 @@ fn eval_bindings(
 impl Expr {
     fn eval(&self, env: Env) -> Result<(Value, Env), LispError> {
         match self {
-            Expr::Def(d) => Expr::eval_def(d, env),
+            Expr::Val(n, b) => Expr::eval_def(n, b.as_ref(), env),
             e => Ok((e.eval_expr(&env)?, env)),
         }
     }
 
     /// Returns the modified env.
-    fn eval_def(def: &Definition, env: Env) -> Result<(Value, Env), LispError> {
-        match def {
-            Definition::Val(n, e) => {
-                let v = e.eval_expr(&env)?;
-                let env_prime = env.bind(n.clone(), v.clone());
-                Ok((v, env_prime))
-            },
-            Definition::Fun(n, ns, e) => {
-                let lambda = Expr::Lambda(ns.clone(), Box::new(e.clone()));
-                let (formals, body, cl_env) = match lambda.eval_expr(&env)? {
-                    Value::Closure(fs, body, env) => (fs, body, env),
-                    v => {
-                        let s = format!("expected a closure to define a function, found: '{}'", v);
-                        return Err(LispError::Type(s));
-                    }
-                };
-                let loc = Env::make_loc();
-                let clo = Value::Closure(formals, body, cl_env.bind_rc(n.to_string(), loc.clone()));
-                *loc.borrow_mut() = Some(clo.clone());
-                Ok((clo, env.bind_rc(n.to_string(), loc)))
-            },
-        }
+    fn eval_def(name: &String, e: &Expr, env: Env) -> Result<(Value, Env), LispError> {
+        let v = e.eval_expr(&env)?;
+        let env_prime = env.bind(name.clone(), v.clone());
+        Ok((v, env_prime))
     }
 
     /// Does not modify env, and returns the evaluated expression.
@@ -834,7 +817,7 @@ impl Expr {
         use Expr::*;
 
         match self {
-            Def(_) => unreachable!(),
+            Val(_, _) => unreachable!(),
             Literal(Value::Quote(b)) => Ok(*b.clone()),
             Literal(l) => Ok(l.clone()),
             Var(n) => env.lookup(&n),

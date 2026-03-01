@@ -82,3 +82,8 @@
       (if (f elem)
         (cons elem (filter f (cdr xs)))
         (filter f (cdr xs))))))
+
+(define range (from to)
+  (if (>= from to)
+    '()
+    (cons from (range (+ from 1) to))))
