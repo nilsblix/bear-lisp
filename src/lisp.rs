@@ -4,7 +4,7 @@ use std::cell::{RefCell, RefMut};
 use std::rc::Rc;
 
 #[derive(Debug)]
-enum ParseError {
+pub enum ParseError {
     Eof,
     Lisp(LispError),
 }
@@ -46,7 +46,7 @@ fn symbol_start(c: char) -> bool {
     }
 }
 
-struct Stream<S>
+pub struct Stream<S>
 where S: Iterator<Item = char>
 {
     s: std::iter::Peekable<S>,
@@ -57,7 +57,7 @@ where S: Iterator<Item = char>
 impl<S> Stream<S>
 where S: Iterator<Item = char>
 {
-    fn new(s: S) -> Self {
+    pub fn new(s: S) -> Self {
         Self { s: s.peekable(), line_num: 1, unread: Vec::new() }
     }
 
@@ -131,7 +131,7 @@ where S: Iterator<Item = char>
     }
 
     /// None means eof
-    fn read_value(&mut self) -> Result<Value, ParseError> {
+    pub fn read_value(&mut self) -> Result<Value, ParseError> {
         self.eat_whitespace();
 
         let c = match self.read_char() {
@@ -209,7 +209,7 @@ where S: Iterator<Item = char>
 }
 
 impl Stream<std::vec::IntoIter<char>> {
-    fn from_str(s: &str) -> Self {
+    pub fn from_str(s: &str) -> Self {
         let iter = s
             .chars()
             .collect::<Vec<char>>()
@@ -219,12 +219,12 @@ impl Stream<std::vec::IntoIter<char>> {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-struct Env {
+pub struct Env {
     items: Vec<(String, Rc<RefCell<Option<Value>>>)>,
 }
 
 #[derive(Debug)]
-enum StdlibError {
+pub enum StdlibError {
     Io(io::Error),
     Lisp(LispError),
 }
@@ -325,6 +325,17 @@ impl Env {
         let prim_eq = Primitive("eq".to_string(), |args| {
             num_args("eq", 2, args)?;
             Ok(Value::Bool(args[0] == args[1]))
+        });
+
+        let prim_mod = Primitive("mod".to_string(), |args| {
+            num_args("mod", 2, args)?;
+            if let (Value::Fixnum(a), Value::Fixnum(b)) = (args[0], args[1]) {
+                Ok(Value::Fixnum(a % b))
+            } else {
+                let s = format!("'mod' primitive expects two integer arguments, found: '{}' and '{}'",
+                    args[0], args[1]);
+                Err(LispError::Type(s))
+            }
         });
 
         let prim_pair = Primitive("pair".to_string(), |args| {
@@ -442,7 +453,7 @@ impl Env {
         let prim_add = bin_fixnum_prim!("+", Value::Fixnum, +);
         let prim_sub = bin_fixnum_prim!("-", Value::Fixnum, -);
         let prim_mult = bin_fixnum_prim!("*", Value::Fixnum, *);
-        let prim_lt = bin_fixnum_prim!("<", Value::Bool, <);
+        let prim_le = bin_fixnum_prim!("<", Value::Bool, <);
         let prim_gt = bin_fixnum_prim!(">", Value::Bool, >);
         let prim_lte = bin_fixnum_prim!("<=", Value::Bool, <=);
         let prim_gte = bin_fixnum_prim!(">=", Value::Bool, >=);
@@ -454,11 +465,12 @@ impl Env {
         let env = env.bind("-".to_string(), prim_sub);
         let env = env.bind("*".to_string(), prim_mult);
         let env = env.bind("/".to_string(), prim_div);
-        let env = env.bind("<".to_string(), prim_lt);
+        let env = env.bind("<".to_string(), prim_le);
         let env = env.bind(">".to_string(), prim_gt);
         let env = env.bind("<=".to_string(), prim_lte);
         let env = env.bind(">=".to_string(), prim_gte);
         let env = env.bind("=".to_string(), prim_int_eq);
+        let env = env.bind("mod".to_string(), prim_mod);
         let env = env.bind("pair".to_string(), prim_pair);
         let env = env.bind("list".to_string(), prim_list);
         let env = env.bind("car".to_string(), prim_car);
@@ -484,7 +496,7 @@ impl Env {
         Value::list_to_pair(los)
     }
 
-    fn with_stdlib() -> Result<Env, StdlibError> {
+    pub fn with_stdlib() -> Result<Env, StdlibError> {
         let path = std::path::Path::new("stdlib.lsp");
         let mut buf = String::new();
 
@@ -518,7 +530,7 @@ impl fmt::Display for Env {
 
 /// Left-object
 #[derive(Debug, PartialEq, Clone)]
-enum Value {
+pub enum Value {
     Fixnum(i64),
     Bool(bool),
     Symbol(String),
@@ -570,7 +582,7 @@ impl Value {
         }
     }
 
-    fn build_ast(&self) -> Result<Expr, LispError> {
+    pub fn build_ast(&self) -> Result<Expr, LispError> {
         use Value::*;
         match self {
             Primitive(_, _) | Closure(_, _, _) => unreachable!(), // shouldn't happen at this stage.
@@ -587,7 +599,7 @@ impl Value {
                     [sym, func, args] if matches!(sym, Symbol(s) if s == "apply") =>
                         Ok(Expr::Apply(Box::new((func.build_ast()?, args.build_ast()?)))),
                     [sym, Symbol(n), e] if matches!(sym, Symbol(s) if s == "val") =>
-                        Ok(Expr::Val(n.clone(), Box::new(e.build_ast()?))),
+                        Ok(Expr::Def(Box::new(Definition::Val(n.clone(), e.build_ast()?)))),
                     [sym, e] if matches!(sym, Symbol(s) if s == "quote") =>
                         Ok(Expr::Literal((*e).clone())),
                     [sym, conditions @ ..] if matches!(sym, Symbol(s) if s == "cond") => {
@@ -651,11 +663,7 @@ impl Value {
                             .collect::<Result<Vec<String>, LispError>>()?;
                         assert_unique(&"define", formals.as_slice())?;
                         let ast = e.build_ast()?;
-
-                        let var = Expr::Var(n.clone());
-                        let lam = Expr::Lambda(formals, Box::new(ast));
-                        let let_rec = Expr::Let(Lets::Rec, vec![(n.clone(), Box::new(lam))], Box::new(var));
-                        Ok(Expr::Val(n.clone(), Box::new(let_rec)))
+                        Ok(Expr::Def(Box::new(Definition::Fun(n.clone(), formals, ast))))
                     },
                     [Symbol(s), bindings, exp] if bindings.is_list() && Lets::is_valid(s) => {
                         let l = Lets::map(s).unwrap();
@@ -739,7 +747,7 @@ impl Value {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum Expr {
+pub enum Expr {
     Literal(Value),
     Var(String),
     If(Box<(Expr, Expr, Expr)>),
@@ -748,12 +756,13 @@ enum Expr {
     Apply(Box<(Expr, Expr)>),
     Call(Box<(Expr, Vec<Expr>)>),
     Lambda(Vec<String>, Box<Expr>),
+    /// (kind, bindings, in)
     Let(Lets, Vec<(String, Box<Expr>)>, Box<Expr>),
-    Val(String, Box<Expr>),
+    Def(Box<Definition>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum Lets {
+pub enum Lets {
     Fixed, Star, Rec,
 }
 
@@ -784,6 +793,12 @@ impl fmt::Display for Lets {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub enum Definition {
+    Val(String, Expr),
+    Fun(String, Vec<String>, Expr),
+}
+
 fn eval_bindings(
     bindings: &Vec<(String, Box<Expr>)>,
     env: &Env
@@ -798,18 +813,36 @@ fn eval_bindings(
 }
 
 impl Expr {
-    fn eval(&self, env: Env) -> Result<(Value, Env), LispError> {
+    pub fn eval(&self, env: Env) -> Result<(Value, Env), LispError> {
         match self {
-            Expr::Val(n, b) => Expr::eval_def(n, b.as_ref(), env),
+            Expr::Def(d) => Expr::eval_def(d, env),
             e => Ok((e.eval_expr(&env)?, env)),
         }
     }
 
     /// Returns the modified env.
-    fn eval_def(name: &String, e: &Expr, env: Env) -> Result<(Value, Env), LispError> {
-        let v = e.eval_expr(&env)?;
-        let env_prime = env.bind(name.clone(), v.clone());
-        Ok((v, env_prime))
+    fn eval_def(def: &Definition, env: Env) -> Result<(Value, Env), LispError> {
+        match def {
+            Definition::Val(n, e) => {
+                let v = e.eval_expr(&env)?;
+                let env_prime = env.bind(n.clone(), v.clone());
+                Ok((v, env_prime))
+            },
+            Definition::Fun(n, ns, e) => {
+                let lambda = Expr::Lambda(ns.clone(), Box::new(e.clone()));
+                let (formals, body, cl_env) = match lambda.eval_expr(&env)? {
+                    Value::Closure(fs, body, env) => (fs, body, env),
+                    v => {
+                        let s = format!("expected a closure to define a function, found: '{}'", v);
+                        return Err(LispError::Type(s));
+                    }
+                };
+                let loc = Env::make_loc();
+                let clo = Value::Closure(formals, body, cl_env.bind_rc(n.to_string(), loc.clone()));
+                *loc.borrow_mut() = Some(clo.clone());
+                Ok((clo, env.bind_rc(n.to_string(), loc)))
+            },
+        }
     }
 
     /// Does not modify env, and returns the evaluated expression.
@@ -817,7 +850,7 @@ impl Expr {
         use Expr::*;
 
         match self {
-            Val(_, _) => unreachable!(),
+            Def(_) => unreachable!(),
             Literal(Value::Quote(b)) => Ok(*b.clone()),
             Literal(l) => Ok(l.clone()),
             Var(n) => env.lookup(&n),
@@ -967,89 +1000,6 @@ impl fmt::Display for Value {
             Closure(_, _, _) => write!(f, "#<closure>"),
         }
     }
-}
-
-fn repl<S: Iterator<Item = char>>(
-    stream: &mut Stream<S>,
-    env: Env,
-) -> io::Result<Env> {
-    use ParseError::*;
-
-    let mut e = env;
-    loop {
-        let expr = match stream.read_value() {
-            Ok(v) => v,
-            Err(Eof) => break,
-            Err(Lisp(e)) => {
-                println!("error: lisp: {e}");
-                continue;
-            }
-        };
-
-        let ast = match expr.build_ast() {
-            Ok(a) => a,
-            Err(l) => {
-                println!("error: lisp: {l}");
-                continue;
-            },
-        };
-
-        let (result, env_prime) = match ast.eval(e.clone()) {
-            Ok(x) => x,
-            Err(l) => {
-                println!("error: lisp: {l}");
-                continue;
-            },
-        };
-        e = env_prime;
-
-        println!("{result}");
-    }
-    Ok(e)
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use rustyline::error::ReadlineError;
-    use rustyline::DefaultEditor;
-
-    let mut env = match Env::with_stdlib() {
-        Ok(env) => env,
-        Err(e) => {
-            println!("{e}");
-            return Ok(());
-        },
-    };
-
-    let args: Vec<String> = std::env::args().collect();
-    if let Some(path) = args.get(1) {
-        let p = std::path::Path::new(path);
-        let mut f = std::fs::File::open(p)?;
-
-        let mut buf = Vec::new();
-        let _ = f.read_to_end(&mut buf)?;
-
-        let s = String::from_utf8(buf).unwrap_or_else(|_| panic!("bad..."));
-        let mut stream = Stream::from_str(s.as_str());
-        _ = repl(&mut stream, env)?;
-        return Ok(());
-    }
-
-    let mut rl = DefaultEditor::new()?;
-    loop {
-        let readline = rl.readline("$> ");
-        match readline {
-            Ok(line) => {
-                let mut stream = Stream::from_str(line.as_str());
-                env = repl(&mut stream, env)?;
-            },
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
-            Err(err) => {
-                println!("Error: {:?}", err);
-                break;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

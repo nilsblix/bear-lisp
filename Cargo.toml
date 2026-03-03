@@ -3,9 +3,5 @@ name = "bear-lisp"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "bear-lisp"
-path = "lisp.rs"
-
 [dependencies]
 rustyline = "17.0.2"
