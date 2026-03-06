@@ -1,4 +1,6 @@
-use std::io::{Write, Read, self};
+#![allow(dead_code)]
+
+use std::io::{Read, self};
 
 mod lisp;
 mod vm;
@@ -48,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut asm_file = std::fs::File::open("program.vasm")?;
     let mut asm = String::new();
     _ = asm_file.read_to_string(&mut asm);
-    let mut assembler = vm::Assembler::new();
+    let mut assembler = vm::asm::Assembler::new();
     let program = match assembler.assemble_str(&asm) {
         Ok(is) => is,
         Err(e) => {

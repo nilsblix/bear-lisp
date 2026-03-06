@@ -1,0 +1,166 @@
+use std::fmt;
+use std::io;
+use std::error;
+
+use crate::vm::internals::{Value, Instruction, Procedure, self};
+use crate::vm::asm::{Assembler, LoadError, self};
+
+#[derive(Debug)]
+pub enum Error {
+    StackOverflow,
+    StackUnderflow,
+    DivByZero,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::StackOverflow => write!(f, "stack overflow"),
+            Error::StackUnderflow => write!(f, "stack underflow"),
+            Error::DivByZero => write!(f, "tried to divide by zero"),
+        }
+    }
+}
+
+impl error::Error for Error {}
+
+
+pub struct Machine<'m> {
+    pub stack: &'m mut [Value],
+    pub head: usize,
+    pub program: &'m [Instruction],
+    pub ip: usize,
+}
+
+impl<'a> Machine<'a> {
+    pub fn new(stack: &'a mut [Value], program: &'a [Instruction]) -> Self {
+        Self { stack, head: 0, program, ip: 0 }
+    }
+
+    pub fn from_ir(stack: &'a mut [u8], program: &'a [Instruction]) -> Result<Self, internals::CastError> {
+        let stack = internals::cast_slice_mut::<u8, Value>(stack)?;
+        Ok(Self::new(stack, program))
+    }
+
+    pub fn from_reader<R: io::Read>(r: R, stack: &'a mut [u8], program: &'a mut [Instruction]) -> Result<Self, LoadError> {
+        let n = asm::load_program(r, program)?;
+        let ir = &program[0..n];
+        Self::from_ir(stack, ir).map_err(|e| LoadError::CastError(e))
+    }
+
+    fn next_instruction(&mut self) -> Option<Instruction> {
+        if self.ip >= self.program.len() {
+            None
+        } else {
+            let popped = self.program[self.ip];
+            self.ip += 1;
+            Some(popped)
+        }
+    }
+
+    fn push_stack(&mut self, v: Value) -> Result<(), Error> {
+        if self.head >= self.stack.len() {
+            Err(Error::StackOverflow)
+        } else {
+            self.stack[self.head] = v;
+            self.head += 1;
+            Ok(())
+        }
+    }
+
+    fn pop_stack(&mut self) -> Result<Value, Error> {
+        if self.head == 0 {
+            Err(Error::StackUnderflow)
+        } else {
+            self.head -= 1;
+            Ok(self.stack[self.head])
+        }
+    }
+
+    pub fn last_value(&self) -> Option<Value> {
+        if self.head == 0 {
+            None
+        } else {
+            Some(self.stack[self.head - 1])
+        }
+    }
+
+    /// The machine halts when `ip` reaches the end of the program.
+    pub fn run(&mut self) -> Result<(), Error> {
+        use Procedure::*;
+        loop {
+            let ins = match self.next_instruction() {
+                Some(i) => i,
+                None => return Ok(()),
+            };
+
+            macro_rules! binary_op {
+                ($op:tt) => {
+                    {
+                        let b = self.pop_stack()?;
+                        let a = self.pop_stack()?;
+                        self.push_stack(a $op b)?;
+                    }
+                };
+            }
+
+            macro_rules! binary_jump {
+                ($op:tt) => {
+                    {
+                        let rhs = self.pop_stack()?;
+                        let lhs = self.pop_stack()?;
+                        if lhs $op rhs {
+                            self.ip = ins.operand as usize;
+                        }
+                    }
+                };
+            }
+
+            match ins.proc {
+                Nop => continue,
+                Push => self.push_stack(ins.operand)?,
+                Add => binary_op!(+),
+                Sub => binary_op!(-),
+                Mult => binary_op!(*),
+                Div => {
+                    let b = self.pop_stack()?;
+                    if b == 0 {
+                        return Err(Error::DivByZero);
+                    }
+                   let a = self.pop_stack()?;
+                    self.push_stack(a / b)?;
+                },
+                Jump => self.ip = ins.operand as usize,
+                JumpIfNonZero => {
+                    if self.pop_stack()? > 0 {
+                       self.ip = ins.operand as usize;
+                    }
+                },
+                JumpIfLt => binary_jump!(<),
+                JumpIfLe => binary_jump!(<=),
+                JumpIfGt => binary_jump!(>),
+                JumpIfGe => binary_jump!(>=),
+                Dup => self.push_stack(self.last_value().ok_or(Error::StackUnderflow)?)?,
+                Swap => {
+                    let b = self.pop_stack()?;
+                    let a = self.pop_stack()?;
+                    self.push_stack(b)?;
+                    self.push_stack(a)?;
+                }
+                Over => {
+                    if self.head < 2 {
+                        return Err(Error::StackUnderflow);
+                    }
+                    let v = self.stack[self.head - 2];
+                    self.push_stack(v)?;
+                }
+            }
+        }
+    }
+
+    /// Helper method to help discoverability of Assembler
+    #[allow(dead_code)]
+    pub fn assembler() -> Assembler {
+        Assembler::new()
+    }
+}
