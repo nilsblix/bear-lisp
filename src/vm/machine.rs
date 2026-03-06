@@ -2,7 +2,7 @@ use std::fmt;
 use std::io;
 use std::error;
 
-use crate::vm::internals::{Value, Instruction, Procedure, self};
+use crate::vm::internals::{Value, Instruction, Opcode, self};
 use crate::vm::asm::{Assembler, LoadError, self};
 
 #[derive(Debug)]
@@ -87,7 +87,7 @@ impl<'a> Machine<'a> {
 
     /// The machine halts when `ip` reaches the end of the program.
     pub fn run(&mut self) -> Result<(), Error> {
-        use Procedure::*;
+        use Opcode::*;
         loop {
             let ins = match self.next_instruction() {
                 Some(i) => i,
@@ -104,21 +104,41 @@ impl<'a> Machine<'a> {
                 };
             }
 
-            macro_rules! binary_jump {
+            macro_rules! binary_cmp {
                 ($op:tt) => {
                     {
                         let rhs = self.pop_stack()?;
                         let lhs = self.pop_stack()?;
                         if lhs $op rhs {
-                            self.ip = ins.operand as usize;
+                            self.push_stack(1)?;
+                        } else {
+                            self.push_stack(0)?;
                         }
                     }
                 };
             }
 
-            match ins.proc {
+            match ins.op {
                 Nop => continue,
                 Push => self.push_stack(ins.operand)?,
+                True => self.push_stack(1)?,
+                False => self.push_stack(0)?,
+                Pop => _ = self.pop_stack()?,
+                Dup => self.push_stack(self.last_value().ok_or(Error::StackUnderflow)?)?,
+                Swap => {
+                    let b = self.pop_stack()?;
+                    let a = self.pop_stack()?;
+                    self.push_stack(b)?;
+                    self.push_stack(a)?;
+                },
+                Over => {
+                    if self.head < 2 {
+                        return Err(Error::StackUnderflow);
+                    }
+                    let v = self.stack[self.head - 2];
+                    self.push_stack(v)?;
+                }
+
                 Add => binary_op!(+),
                 Sub => binary_op!(-),
                 Mult => binary_op!(*),
@@ -130,30 +150,17 @@ impl<'a> Machine<'a> {
                    let a = self.pop_stack()?;
                     self.push_stack(a / b)?;
                 },
+
+                NumEq => binary_cmp!(==),
+                LT => binary_cmp!(<),
+                GT => binary_cmp!(>),
+
                 Jump => self.ip = ins.operand as usize,
                 JumpIfNonZero => {
-                    if self.pop_stack()? > 0 {
-                       self.ip = ins.operand as usize;
+                    if self.pop_stack()? != 0 {
+                        self.ip = ins.operand as usize;
                     }
                 },
-                JumpIfLt => binary_jump!(<),
-                JumpIfLe => binary_jump!(<=),
-                JumpIfGt => binary_jump!(>),
-                JumpIfGe => binary_jump!(>=),
-                Dup => self.push_stack(self.last_value().ok_or(Error::StackUnderflow)?)?,
-                Swap => {
-                    let b = self.pop_stack()?;
-                    let a = self.pop_stack()?;
-                    self.push_stack(b)?;
-                    self.push_stack(a)?;
-                }
-                Over => {
-                    if self.head < 2 {
-                        return Err(Error::StackUnderflow);
-                    }
-                    let v = self.stack[self.head - 2];
-                    self.push_stack(v)?;
-                }
             }
         }
     }

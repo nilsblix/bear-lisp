@@ -5,33 +5,61 @@ pub type Value = i64;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Procedure {
-    Nop = 0,
+pub enum Opcode {
+    Nop,
     Push,
+    True,
+    False,
+    Pop,
+    Dup,
+    Swap,
+    Over,
+
     Add,
     Sub,
     Mult,
     Div,
+
+    NumEq,
+    LT,
+    GT,
+
     Jump,
     JumpIfNonZero,
-    JumpIfLt,
-    JumpIfLe,
-    JumpIfGt,
-    JumpIfGe,
-    Dup,
-    Swap,
-    Over,
+
+    // Return,
+    //
+    // TODO Implement these. Not sure about all of them, but most should come in
+    // handy when compiling the lisp.
+    // LoadLocal,
+    // StoreLocal,
+    // LoadGlobal,
+    // StoreGlobal,
+    // DefineGlobal,
+    //
+    // Call,
+    // Closure,
+    // LoadUpValue,
+    // StoreUpValue,
+    //
+    // Cons,
+    // Car,
+    // Cdr,
+    //
+    // IsNil,
+    // IsPair,
+    // IsSymbol,
 }
 
-pub struct ProcedureDefinition {
-    pub proc: Procedure,
+pub struct OpcodeDef {
+    pub op: Opcode,
     pub name: &'static str,
     pub expects_operand: bool,
 }
 
-impl ProcedureDefinition {
+impl OpcodeDef {
     pub fn decode_str(s: &str) -> Option<Self> {
-        for def in PROC_DEFS {
+        for def in OPCODE_DEFS {
             if s == def.name {
                 return Some(def);
             }
@@ -40,99 +68,109 @@ impl ProcedureDefinition {
     }
 }
 
-const PROC_DEFS: [ProcedureDefinition; 15] = [
-    ProcedureDefinition {
-        proc: Procedure::Nop,
+const OPCODE_DEFS: [OpcodeDef; 17] = [
+    OpcodeDef {
+        op: Opcode::Nop,
         name: "nop",
         expects_operand: false,
     },
-    ProcedureDefinition {
-        proc: Procedure::Push,
+    OpcodeDef {
+        op: Opcode::Push,
         name: "push",
         expects_operand: true,
     },
-    ProcedureDefinition {
-        proc: Procedure::Add,
-        name: "add",
+    OpcodeDef {
+        op: Opcode::True,
+        name: "true",
         expects_operand: false,
     },
-    ProcedureDefinition {
-        proc: Procedure::Sub,
-        name: "sub",
+    OpcodeDef {
+        op: Opcode::False,
+        name: "false",
         expects_operand: false,
     },
-    ProcedureDefinition {
-        proc: Procedure::Mult,
-        name: "mult",
+    OpcodeDef {
+        op: Opcode::Pop,
+        name: "pop",
         expects_operand: false,
     },
-    ProcedureDefinition {
-        proc: Procedure::Div,
-        name: "div",
-        expects_operand: false,
-    },
-    ProcedureDefinition {
-        proc: Procedure::Jump,
-        name: "jmp",
-        expects_operand: true,
-    },
-    ProcedureDefinition {
-        proc: Procedure::JumpIfNonZero,
-        name: "jnz",
-        expects_operand: true,
-    },
-    ProcedureDefinition {
-        proc: Procedure::JumpIfLt,
-        name: "jlt",
-        expects_operand: true,
-    },
-    ProcedureDefinition {
-        proc: Procedure::JumpIfLe,
-        name: "jle",
-        expects_operand: true,
-    },
-    ProcedureDefinition {
-        proc: Procedure::JumpIfGt,
-        name: "jgt",
-        expects_operand: true,
-    },
-    ProcedureDefinition {
-        proc: Procedure::JumpIfGe,
-        name: "jge",
-        expects_operand: true,
-    },
-    ProcedureDefinition {
-        proc: Procedure::Dup,
+    OpcodeDef {
+        op: Opcode::Dup,
         name: "dup",
         expects_operand: false,
     },
-    ProcedureDefinition {
-        proc: Procedure::Swap,
+    OpcodeDef {
+        op: Opcode::Swap,
         name: "swap",
         expects_operand: false,
     },
-    ProcedureDefinition {
-        proc: Procedure::Over,
+    OpcodeDef {
+        op: Opcode::Over,
         name: "over",
         expects_operand: false,
     },
+    OpcodeDef {
+        op: Opcode::Add,
+        name: "add",
+        expects_operand: false,
+    },
+    OpcodeDef {
+        op: Opcode::Sub,
+        name: "sub",
+        expects_operand: false,
+    },
+    OpcodeDef {
+        op: Opcode::Mult,
+        name: "mult",
+        expects_operand: false,
+    },
+    OpcodeDef {
+        op: Opcode::Div,
+        name: "div",
+        expects_operand: false,
+    },
+    OpcodeDef {
+        op: Opcode::NumEq,
+        name: "numeq",
+        expects_operand: false,
+    },
+    OpcodeDef {
+        op: Opcode::LT,
+        name: "lt",
+        expects_operand: false,
+    },
+    OpcodeDef {
+        op: Opcode::GT,
+        name: "gt",
+        expects_operand: false,
+    },
+    OpcodeDef {
+        op: Opcode::Jump,
+        name: "jump",
+        expects_operand: true,
+    },
+    OpcodeDef {
+        op: Opcode::JumpIfNonZero,
+        name: "jump_on_nz",
+        expects_operand: true,
+    },
 ];
 
-impl Procedure {
+impl Opcode {
     pub fn decode(b: u8) -> Option<Self> {
-        const LEN: u8 = if PROC_DEFS.len() > u8::max_value() as usize {
+        const LEN: u8 = if OPCODE_DEFS.len() > u8::max_value() as usize {
             u8::max_value()
         } else {
-            PROC_DEFS.len() as u8
+            OPCODE_DEFS.len() as u8
         };
         match b {
-            0..LEN => Some(PROC_DEFS[b as usize].proc),
+            0..LEN => Some(OPCODE_DEFS[b as usize].op),
             _ => None,
         }
     }
 }
 
-/// NOTE We don't make some Procedures carry an operand because in the future we
+/// NOTE We don't make some Operations carry an operand because in the future we
 /// want to try to implement a #![no_std] version of this vm. Therefore if we
 /// zero out some instruction space (future implementation of vm's debug mode
 /// with a static stack size), all instructions automatically get set to Nop,
@@ -144,7 +182,7 @@ impl Procedure {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Instruction {
-    pub proc: Procedure,
+    pub op: Opcode,
     _pad: [u8; 7],
     /// Operand is ignored for some operands. Errors inside Assembler or simply
     /// ignored when cast from bytecode.
@@ -152,12 +190,16 @@ pub struct Instruction {
 }
 
 impl Instruction {
-    pub fn new(proc: Procedure, operand: Value) -> Self {
+    pub fn new(opcode: Opcode, operand: Value) -> Self {
         Self {
-            proc,
+            op: opcode,
             _pad: [0u8; 7],
             operand,
         }
+    }
+
+    pub fn zeroed() -> Self {
+        Self::new(Opcode::Nop, 0)
     }
 }
 

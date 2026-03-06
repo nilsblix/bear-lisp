@@ -64,9 +64,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // TIME TO LOAD
 
-    const MEM_CAPACITY: usize = 64 * 1024;
+    const MEM_CAPACITY: usize = 16 * 1024;
     let mut stack = [0u8; MEM_CAPACITY];
-    let mut program: [vm::Instruction; MEM_CAPACITY] = unsafe { std::mem::zeroed() };
+    let mut program = [vm::Instruction::zeroed(); MEM_CAPACITY];
 
     let f = std::fs::File::open("program.vm")?;
     let mut m = vm::Machine::from_reader(f, &mut stack, &mut program)?;

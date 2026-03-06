@@ -2,7 +2,7 @@ use std::fmt;
 use std::io;
 use std::error;
 
-use crate::vm::internals::{Value, Instruction, Procedure, ProcedureDefinition, CastError};
+use crate::vm::internals::{Value, Instruction, Opcode, OpcodeDef, CastError};
 
 const HEADER: [u8; 12] = *b"VM/MAR_26/LE";
 
@@ -15,7 +15,7 @@ pub fn save_program<W: io::Write>(mut w: W, program: &[Instruction]) -> io::Resu
 
     for ins in program {
         // 9 bytes per instruction
-        w.write_all(&[ins.proc as u8])?;
+        w.write_all(&[ins.op as u8])?;
         w.write_all(&ins.operand.to_le_bytes())?;
     }
 
@@ -29,7 +29,7 @@ pub enum LoadError {
     FaultyHeader,
     BackingTooSmall,
     Truncated,
-    UnknownProcedure,
+    OpCode,
 }
 
 impl fmt::Display for LoadError {
@@ -40,7 +40,7 @@ impl fmt::Display for LoadError {
             LoadError::FaultyHeader => write!(f, "faulty header"),
             LoadError::BackingTooSmall => write!(f, "program's backing buffer is too small"),
             LoadError::Truncated => write!(f, "instruction got cut of by eof"),
-            LoadError::UnknownProcedure => write!(f, "unknown procedure-byte"),
+            LoadError::OpCode => write!(f, "unknown opcode"),
         }
     }
 }
@@ -67,10 +67,10 @@ pub(super) fn load_program<R: io::Read>(mut r: R, out: &mut [Instruction]) -> Re
     }
 
     for i in 0..count {
-        let mut proc_b = [0u8; 1];
+        let mut opco_b = [0u8; 1];
         let mut oper_b = [0u8; 8];
 
-        r.read_exact(&mut proc_b)
+        r.read_exact(&mut opco_b)
             .map_err(|e| if e.kind() == io::ErrorKind::UnexpectedEof {
                 LoadError::Truncated
             } else { LoadError::Io(e) })?;
@@ -80,13 +80,13 @@ pub(super) fn load_program<R: io::Read>(mut r: R, out: &mut [Instruction]) -> Re
                 LoadError::Truncated
             } else { LoadError::Io(e) })?;
 
-        let proc = Procedure::decode(proc_b[0]);
-        if proc.is_none() {
-            return Err(LoadError::UnknownProcedure);
+        let opcode = Opcode::decode(opco_b[0]);
+        if opcode.is_none() {
+            return Err(LoadError::OpCode);
         }
-        let proc = proc.unwrap();
+        let opcode = opcode.unwrap();
 
-        out[i] = Instruction::new(proc, Value::from_le_bytes(oper_b));
+        out[i] = Instruction::new(opcode, Value::from_le_bytes(oper_b));
     }
 
     Ok(count)
@@ -126,14 +126,14 @@ impl Assembler {
             let l = l.map_err(|e| self.err(format!("io error: {}", e)))?;
             let mut split = l.split_whitespace();
 
-            let proc_str = match split.next() {
+            let opcode_str = match split.next() {
                 Some(p) if p == ";" => continue,
                 Some(p) => p,
                 None => continue, // empty line
             };
 
-            let proc_def = ProcedureDefinition::decode_str(proc_str)
-                .ok_or(self.err(format!("unknown procedure: '{proc_str}'")))?;
+            let opcode_def = OpcodeDef::decode_str(opcode_str)
+                .ok_or(self.err(format!("unknown operation: '{opcode_str}'")))?;
 
             let op_tok = match split.next() {
                 Some(";") | None => None,
@@ -144,23 +144,23 @@ impl Assembler {
                 None => ("", None),
             };
 
-            let op = match (proc_def.expects_operand, op_tok, op_val) {
+            let op = match (opcode_def.expects_operand, op_tok, op_val) {
                 (true, _, Some(i)) => i,
                 (true, _, None) => {
                     let msg = format!(
-                        "procedure '{}' expects an integer operand, found: '{}'",
-                        proc_str, op_str
+                        "operation '{}' expects an operand, found: '{}'",
+                        opcode_str, op_str
                     );
                     return Err(self.err(msg));
                 }
                 (false, Some(v), _) => {
-                    let msg = format!("procedure '{}' expects no operand, found: '{}'", proc_str, v);
+                    let msg = format!("operation '{}' doesn't expect an operand, found: '{}'", opcode_str, v);
                     return Err(self.err(msg));
                 }
                 (false, None, _) => 0,
             };
 
-            let ins = Instruction::new(proc_def.proc, op);
+            let ins = Instruction::new(opcode_def.op, op);
             program.push(ins);
         }
 
