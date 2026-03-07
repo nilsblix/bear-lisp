@@ -125,7 +125,7 @@ mod tests {
         let mut stack = [0u8; MEM_CAPACITY];
 
         let mut m = Machine::from_ir(&mut stack, program.as_slice()).unwrap();
-        assert_eq!(m.head, 0);
+        assert_eq!(m.sp, 0);
         assert_eq!(m.ip, 0);
 
         m.run().unwrap();
@@ -149,8 +149,28 @@ mod tests {
         let mut m = Machine::from_ir(&mut stack, program.as_slice()).unwrap();
         m.run().unwrap();
 
-        assert_eq!(m.head, 2);
-        assert_eq!(m.stack[m.head - 2], 34);
+        assert_eq!(m.sp, 2);
+        assert_eq!(m.stack[m.sp - 2], 34);
         assert_eq!(m.last_value(), Some(55));
+    }
+
+    #[test]
+    fn simple_jump_on_nz() {
+        let source = "
+            push 0
+            push 1       ; [... 1 1]
+            add          ; [... 2]
+            dup          ; [... 2 2]
+            push 10032   ; [... 2 2 10032]
+            lt           ; [... 2 1] or [... 2 0]
+            jump_on_nz 1
+            ";
+        let ins = Assembler::new().assemble_str(source).unwrap();
+
+        let mut stack = [0u8; MEM_CAPACITY];
+        let mut m = Machine::from_ir(&mut stack, ins.as_slice()).unwrap();
+        m.run().unwrap();
+        let res = m.last_value().unwrap();
+        assert_eq!(res, 10032);
     }
 }

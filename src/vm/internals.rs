@@ -1,6 +1,12 @@
 use std::fmt;
 use std::error;
 
+/// This typed can encode all relevant operands:
+/// * Bool     - 0 or 1
+/// * Int      - regular i64
+/// * Heap ref - i64 acts like an address (TODO Implement the heap/ram)
+///
+/// TODO Find an idiomatic way to encode nil.
 pub type Value = i64;
 
 #[repr(u8)]

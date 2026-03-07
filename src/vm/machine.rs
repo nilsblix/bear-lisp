@@ -27,14 +27,18 @@ impl error::Error for Error {}
 
 pub struct Machine<'m> {
     pub stack: &'m mut [Value],
-    pub head: usize,
+    pub sp: usize,
     pub program: &'m [Instruction],
     pub ip: usize,
+    // TODO Ram/heap. Might look something like this to make StackValue be an
+    // enum over i64 and u32, where HeapValue contains some metadata, ex some
+    // header with type-info.
+    // mem: &'m mut [HeapValue],
 }
 
 impl<'a> Machine<'a> {
     pub fn new(stack: &'a mut [Value], program: &'a [Instruction]) -> Self {
-        Self { stack, head: 0, program, ip: 0 }
+        Self { stack, sp: 0, program, ip: 0 }
     }
 
     pub fn from_ir(stack: &'a mut [u8], program: &'a [Instruction]) -> Result<Self, internals::CastError> {
@@ -59,29 +63,29 @@ impl<'a> Machine<'a> {
     }
 
     fn push_stack(&mut self, v: Value) -> Result<(), Error> {
-        if self.head >= self.stack.len() {
+        if self.sp >= self.stack.len() {
             Err(Error::StackOverflow)
         } else {
-            self.stack[self.head] = v;
-            self.head += 1;
+            self.stack[self.sp] = v;
+            self.sp += 1;
             Ok(())
         }
     }
 
     fn pop_stack(&mut self) -> Result<Value, Error> {
-        if self.head == 0 {
+        if self.sp == 0 {
             Err(Error::StackUnderflow)
         } else {
-            self.head -= 1;
-            Ok(self.stack[self.head])
+            self.sp -= 1;
+            Ok(self.stack[self.sp])
         }
     }
 
     pub fn last_value(&self) -> Option<Value> {
-        if self.head == 0 {
+        if self.sp == 0 {
             None
         } else {
-            Some(self.stack[self.head - 1])
+            Some(self.stack[self.sp - 1])
         }
     }
 
@@ -132,10 +136,10 @@ impl<'a> Machine<'a> {
                     self.push_stack(a)?;
                 },
                 Over => {
-                    if self.head < 2 {
+                    if self.sp < 2 {
                         return Err(Error::StackUnderflow);
                     }
-                    let v = self.stack[self.head - 2];
+                    let v = self.stack[self.sp - 2];
                     self.push_stack(v)?;
                 }
 
